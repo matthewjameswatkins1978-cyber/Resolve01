@@ -10,10 +10,9 @@ long-term memory system.
 
 ## Status
 
-The repository is currently at S0 (bootstrap). The Rust workspace and the
-implementation-current R0 boundary documents are in place. Domain behavior,
-persistence, fencing, recovery, and structural planning are intentionally
-not implemented yet.
+The repository is currently at S2 (persistence). The Rust workspace, S1
+domain model, and SQLite/WAL persistence boundary are implemented. Fencing,
+recovery, and structural planning are intentionally not implemented yet.
 
 ## Workspace
 
