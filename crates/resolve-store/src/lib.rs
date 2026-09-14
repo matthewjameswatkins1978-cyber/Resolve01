@@ -1,4 +1,10 @@
-//! Persistence boundary for Resolve R0.
-//!
-//! S0 establishes the crate boundary only. SQLite, WAL, schema, event
-//! persistence, and recovery behavior are delivered in later sections.
+//! SQLite persistence boundary for Resolve R0.
+
+mod error;
+mod schema;
+mod sqlite;
+
+pub use error::StoreError;
+pub use sqlite::{
+    AttentionRecord, ClaimRecord, CommitmentRecord, EventRecord, GoalRecord, SqliteStore,
+};
