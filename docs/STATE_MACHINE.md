@@ -1,6 +1,10 @@
 # Commitment state machine
 
-The frozen R0 commitment states are:
+S1 implements the frozen R0 commitment-state boundary in
+`crates/resolve-core/src/state_machine.rs` and the claimant operations on
+`Commitment`.
+
+The states are:
 
 ```text
 PROPOSED -> READY -> CLAIMED -> WORKING
@@ -11,8 +15,20 @@ PROPOSED -> READY -> CLAIMED -> WORKING
 ```
 
 `CANCELLED` and `ABANDONED` are explicit terminal exits. `COMPLETED`,
-`CANCELLED`, and `ABANDONED` are terminal and immutable.
+`CANCELLED`, and `ABANDONED` are terminal and immutable: every attempted
+transition out of one returns `DomainError::TerminalCommitmentImmutable`.
+
+`validate_transition` checks the legal R0 topology and returns
+`DomainError::InvalidTransition` for other non-terminal edges. The
+`Commitment` API exposes `activate`, `claim_for`, `start`, `wait`, `resume`,
+`propose_completion`, `complete`, `cancel`, and `abandon`. Worker-owned
+operations validate the current worker and claim epoch before changing state.
+
+`resume` explicitly chooses `Ready` (releasing the current claim) or `Working`
+(retaining it). `claim_for` creates the next typed epoch rather than accepting
+an epoch supplied by a worker.
 
 The full transition contract, including lease expiry, restart invalidation,
-waiting reasons, and recovery, is frozen by Issue #1. S0 records the contract
-only; no state-machine implementation exists until S1.
+waiting reasons, and recovery, is frozen by Issue #1. S1 does not implement
+lease expiry, restart recovery, persistence, guard mechanics, structural
+planning, or event emission.
