@@ -20,13 +20,20 @@ epoch.
 
 `GoalSpec` contains `goal_id`, `revision`, `description`, `state`, and
 `created_at`. `GoalSpec::revised` returns a new value only for the exact next
-revision, preserving the prior value for append-only callers.
+revision, preserving the prior value for append-only callers. These fields
+are private and exposed through read-only accessors; there are no generic
+setters.
 
 `Commitment` contains its goal and optional parent references, description,
 typed prerequisites, typed acceptance references, optional `ClaimLease`, and
 an optional `TethersActionRef`. Its state is the closed `CommitmentState`
 enum. Claimant mutations require both the current `WorkerId` and
 `ClaimEpoch`; stale or foreign claims return typed errors.
+All commitment fields are private. Callers receive IDs and parent references,
+descriptions, prerequisite and acceptance slices, state, claim, and
+outstanding-action references through read-only accessors. The outstanding
+action is intentionally read-only until the controlled guard/action lifecycle
+is introduced in S3/S4.
 
 `Prerequisite` has exactly the three R0 forms: commitment, Tethers
 verification, and human decision. `WaitingReason` keeps prerequisite,
@@ -37,4 +44,6 @@ recording or reconciliation behavior.
 
 `AttentionItem` models asynchronous operational escalation, and `WorkEvent`
 is a closed enum covering the R0 event vocabulary. S1 defines these values but
-does not yet append events to storage.
+does not yet append events to storage. `AttentionItem::new` creates an open
+item after validating its description; its state and description are
+read-only, with no attention workflow implemented.

@@ -9,7 +9,7 @@ pub enum ResumeTarget {
 }
 
 /// Validate the frozen R0 commitment-state topology without mutating state.
-pub fn validate_transition(
+pub(crate) fn validate_transition(
     from: &CommitmentState,
     to: &CommitmentState,
 ) -> Result<(), DomainError> {
