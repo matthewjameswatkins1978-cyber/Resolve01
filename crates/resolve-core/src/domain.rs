@@ -142,11 +142,11 @@ pub enum GoalState {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GoalSpec {
-    pub goal_id: GoalId,
-    pub revision: GoalRevision,
-    pub description: String,
-    pub state: GoalState,
-    pub created_at: Timestamp,
+    goal_id: GoalId,
+    revision: GoalRevision,
+    description: String,
+    state: GoalState,
+    created_at: Timestamp,
 }
 
 impl GoalSpec {
@@ -189,6 +189,26 @@ impl GoalSpec {
             created_at: self.created_at,
         })
     }
+
+    pub fn goal_id(&self) -> &GoalId {
+        &self.goal_id
+    }
+
+    pub fn revision(&self) -> GoalRevision {
+        self.revision
+    }
+
+    pub fn description(&self) -> &str {
+        &self.description
+    }
+
+    pub fn state(&self) -> &GoalState {
+        &self.state
+    }
+
+    pub fn created_at(&self) -> Timestamp {
+        self.created_at
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -200,9 +220,23 @@ pub enum Prerequisite {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ClaimLease {
-    pub worker_id: WorkerId,
-    pub epoch: ClaimEpoch,
-    pub last_heartbeat: MonotonicInstant,
+    worker_id: WorkerId,
+    epoch: ClaimEpoch,
+    last_heartbeat: MonotonicInstant,
+}
+
+impl ClaimLease {
+    pub fn worker_id(&self) -> &WorkerId {
+        &self.worker_id
+    }
+
+    pub fn epoch(&self) -> ClaimEpoch {
+        self.epoch
+    }
+
+    pub fn last_heartbeat(&self) -> MonotonicInstant {
+        self.last_heartbeat
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -243,15 +277,15 @@ impl CommitmentState {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Commitment {
-    pub commitment_id: CommitmentId,
-    pub goal_id: GoalId,
-    pub parent_id: Option<CommitmentId>,
-    pub description: String,
+    commitment_id: CommitmentId,
+    goal_id: GoalId,
+    parent_id: Option<CommitmentId>,
+    description: String,
     state: CommitmentState,
-    pub prerequisites: Vec<Prerequisite>,
-    pub acceptance_refs: Vec<AcceptanceRef>,
+    prerequisites: Vec<Prerequisite>,
+    acceptance_refs: Vec<AcceptanceRef>,
     claim: Option<ClaimLease>,
-    pub outstanding_action: Option<TethersActionRef>,
+    outstanding_action: Option<TethersActionRef>,
     last_claim_epoch: Option<ClaimEpoch>,
 }
 
@@ -278,12 +312,40 @@ impl Commitment {
         })
     }
 
+    pub fn commitment_id(&self) -> &CommitmentId {
+        &self.commitment_id
+    }
+
+    pub fn goal_id(&self) -> &GoalId {
+        &self.goal_id
+    }
+
+    pub fn parent_id(&self) -> Option<&CommitmentId> {
+        self.parent_id.as_ref()
+    }
+
+    pub fn description(&self) -> &str {
+        &self.description
+    }
+
+    pub fn prerequisites(&self) -> &[Prerequisite] {
+        &self.prerequisites
+    }
+
+    pub fn acceptance_refs(&self) -> &[AcceptanceRef] {
+        &self.acceptance_refs
+    }
+
     pub fn state(&self) -> &CommitmentState {
         &self.state
     }
 
     pub fn claim(&self) -> Option<&ClaimLease> {
         self.claim.as_ref()
+    }
+
+    pub fn outstanding_action(&self) -> Option<&TethersActionRef> {
+        self.outstanding_action.as_ref()
     }
 
     pub fn activate(&mut self) -> Result<(), DomainError> {
@@ -297,8 +359,8 @@ impl Commitment {
     ) -> Result<ClaimLease, DomainError> {
         if let Some(claim) = &self.claim {
             return Err(DomainError::CommitmentAlreadyClaimed {
-                worker_id: claim.worker_id.clone(),
-                epoch: claim.epoch,
+                worker_id: claim.worker_id().clone(),
+                epoch: claim.epoch(),
             });
         }
         validate_transition(&self.state, &CommitmentState::Claimed)?;
@@ -385,15 +447,15 @@ impl Commitment {
         epoch: ClaimEpoch,
     ) -> Result<(), DomainError> {
         let claim = self.claim.as_ref().ok_or(DomainError::NotClaimed)?;
-        if claim.worker_id != *worker_id {
+        if claim.worker_id() != worker_id {
             return Err(DomainError::ClaimOwnerMismatch {
-                expected: claim.worker_id.clone(),
+                expected: claim.worker_id().clone(),
                 actual: worker_id.clone(),
             });
         }
-        if claim.epoch != epoch {
+        if claim.epoch() != epoch {
             return Err(DomainError::StaleEpoch {
-                expected: claim.epoch,
+                expected: claim.epoch(),
                 actual: epoch,
             });
         }
@@ -415,10 +477,41 @@ pub enum AttentionState {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AttentionItem {
-    pub attention_id: AttentionId,
-    pub commitment_id: Option<CommitmentId>,
-    pub description: String,
-    pub state: AttentionState,
+    attention_id: AttentionId,
+    commitment_id: Option<CommitmentId>,
+    description: String,
+    state: AttentionState,
+}
+
+impl AttentionItem {
+    pub fn new(
+        attention_id: AttentionId,
+        commitment_id: Option<CommitmentId>,
+        description: impl Into<String>,
+    ) -> Result<Self, DomainError> {
+        Ok(Self {
+            attention_id,
+            commitment_id,
+            description: nonempty_description(description)?,
+            state: AttentionState::Open,
+        })
+    }
+
+    pub fn attention_id(&self) -> &AttentionId {
+        &self.attention_id
+    }
+
+    pub fn commitment_id(&self) -> Option<&CommitmentId> {
+        self.commitment_id.as_ref()
+    }
+
+    pub fn description(&self) -> &str {
+        &self.description
+    }
+
+    pub fn state(&self) -> AttentionState {
+        self.state
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -606,27 +699,30 @@ mod tests {
         let first = commitment
             .claim_for(worker("worker-1"), MonotonicInstant::from_ticks(10))
             .expect("first claim succeeds");
+        assert_eq!(first.worker_id(), &worker("worker-1"));
+        assert_eq!(first.epoch(), ClaimEpoch::initial());
+        assert_eq!(first.last_heartbeat(), MonotonicInstant::from_ticks(10));
         commitment
-            .start(&first.worker_id, first.epoch)
+            .start(first.worker_id(), first.epoch())
             .expect("current claim can start");
         commitment
             .wait(
-                &first.worker_id,
-                first.epoch,
+                first.worker_id(),
+                first.epoch(),
                 WaitingReason::External("worker needs input".to_owned()),
             )
             .expect("current claim can wait");
         commitment
-            .resume(&first.worker_id, first.epoch, ResumeTarget::Ready)
+            .resume(first.worker_id(), first.epoch(), ResumeTarget::Ready)
             .expect("current claim can release back to ready");
 
         let second = commitment
             .claim_for(worker("worker-2"), MonotonicInstant::from_ticks(20))
             .expect("second claim succeeds");
-        assert_eq!(second.epoch.value(), first.epoch.value() + 1);
+        assert_eq!(second.epoch().value(), first.epoch().value() + 1);
 
         let error = commitment
-            .start(&first.worker_id, first.epoch)
+            .start(first.worker_id(), first.epoch())
             .expect_err("old worker epoch must be fenced");
         assert_eq!(
             error,
@@ -637,13 +733,13 @@ mod tests {
         );
 
         let error = commitment
-            .start(&second.worker_id, first.epoch)
+            .start(second.worker_id(), first.epoch())
             .expect_err("old epoch must not mutate current worker claim");
         assert_eq!(
             error,
             DomainError::StaleEpoch {
-                expected: second.epoch,
-                actual: first.epoch,
+                expected: second.epoch(),
+                actual: first.epoch(),
             }
         );
     }
@@ -677,15 +773,15 @@ mod tests {
             Timestamp::from_unix_seconds(0),
         )
         .expect("test goal is valid");
-        let next_revision = original.revision.next().expect("revision can advance");
+        let next_revision = original.revision().next().expect("revision can advance");
         let revised = original
             .revised(next_revision, "revised goal")
             .expect("exact next revision is accepted");
 
-        assert_eq!(original.revision, GoalRevision::initial());
-        assert_eq!(original.description, "original goal");
-        assert_eq!(revised.revision, next_revision);
-        assert_eq!(revised.description, "revised goal");
+        assert_eq!(original.revision(), GoalRevision::initial());
+        assert_eq!(original.description(), "original goal");
+        assert_eq!(revised.revision(), next_revision);
+        assert_eq!(revised.description(), "revised goal");
 
         let error = original
             .revised(
@@ -711,6 +807,23 @@ mod tests {
                 Timestamp::from_unix_seconds(0),
             )
             .expect_err("blank goal description is malformed"),
+            DomainError::EmptyDescription
+        );
+    }
+
+    #[test]
+    fn attention_items_use_a_validated_constructor_and_read_only_values() {
+        let attention_id = AttentionId::try_new("attention-1").expect("test identifier is valid");
+        let item = AttentionItem::new(attention_id.clone(), None, "human input required")
+            .expect("test attention item is valid");
+
+        assert_eq!(item.attention_id(), &attention_id);
+        assert_eq!(item.commitment_id(), None);
+        assert_eq!(item.description(), "human input required");
+        assert_eq!(item.state(), AttentionState::Open);
+        assert_eq!(
+            AttentionItem::new(attention_id, None, "  ")
+                .expect_err("blank attention description is malformed"),
             DomainError::EmptyDescription
         );
     }

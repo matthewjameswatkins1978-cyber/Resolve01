@@ -2,7 +2,7 @@
 
 pub mod domain;
 pub mod error;
-pub mod state_machine;
+mod state_machine;
 
 pub use domain::{
     AcceptanceRef, AttentionId, AttentionItem, AttentionState, BootGeneration, ClaimEpoch,
@@ -11,4 +11,4 @@ pub use domain::{
     TethersContractRef, TethersOutcome, Timestamp, WaitingReason, WorkEvent, WorkerId,
 };
 pub use error::DomainError;
-pub use state_machine::{ResumeTarget, validate_transition};
+pub use state_machine::ResumeTarget;
