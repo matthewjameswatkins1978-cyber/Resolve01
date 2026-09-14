@@ -1,0 +1,6 @@
+[workspace]
+members = [
+    "crates/resolve-core",
+    "crates/resolve-store",
+]
+resolver = "2"
