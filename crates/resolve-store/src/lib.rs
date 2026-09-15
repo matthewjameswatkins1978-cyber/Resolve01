@@ -6,5 +6,6 @@ mod sqlite;
 
 pub use error::StoreError;
 pub use sqlite::{
-    AttentionRecord, ClaimRecord, CommitmentRecord, EventRecord, GoalRecord, SqliteStore,
+    AttentionRecord, ClaimRecord, CommitmentRecord, EventRecord, GoalRecord, GuardAdmission,
+    GuardIssueRequest, GuardRecord, SqliteStore,
 };

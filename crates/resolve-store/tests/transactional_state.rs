@@ -208,7 +208,7 @@ fn file_store_uses_wal_and_foreign_keys() {
             .foreign_keys_enabled()
             .expect("foreign-key setting reads")
     );
-    assert_eq!(store.schema_version().expect("schema version reads"), 1);
+    assert_eq!(store.schema_version().expect("schema version reads"), 2);
 }
 
 #[test]

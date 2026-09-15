@@ -79,6 +79,16 @@ impl ClaimEpoch {
         self.0
     }
 
+    pub fn try_from_raw(value: i64) -> Result<Self, DomainError> {
+        if value > 0 {
+            Ok(Self(value as u64))
+        } else {
+            Err(DomainError::InvalidNumericValue {
+                kind: "claim epoch",
+            })
+        }
+    }
+
     pub(crate) fn next(self) -> Result<Self, DomainError> {
         self.0
             .checked_add(1)
@@ -117,6 +127,16 @@ impl MonotonicInstant {
     pub const fn ticks(self) -> u64 {
         self.0
     }
+
+    pub fn try_from_raw(value: i64) -> Result<Self, DomainError> {
+        if value >= 0 {
+            Ok(Self(value as u64))
+        } else {
+            Err(DomainError::InvalidNumericValue {
+                kind: "monotonic instant",
+            })
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -129,6 +149,16 @@ impl BootGeneration {
 
     pub const fn value(self) -> u64 {
         self.0
+    }
+
+    pub fn try_from_raw(value: i64) -> Result<Self, DomainError> {
+        if value >= 0 {
+            Ok(Self(value as u64))
+        } else {
+            Err(DomainError::InvalidNumericValue {
+                kind: "boot generation",
+            })
+        }
     }
 }
 
@@ -597,6 +627,7 @@ pub enum WorkEvent {
     },
     GuardAdmitted {
         guard_id: GuardId,
+        commitment_id: CommitmentId,
         action_ref: TethersActionRef,
     },
     GuardInvalidated {
