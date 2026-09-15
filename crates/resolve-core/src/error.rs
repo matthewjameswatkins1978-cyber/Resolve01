@@ -34,6 +34,12 @@ pub enum DomainError {
     },
     EpochExhausted,
     RevisionExhausted,
+    InvalidDuration,
+    InvalidLeaseDeadline,
+    TimeOverflow,
+    InvalidNumericValue {
+        kind: &'static str,
+    },
 }
 
 impl fmt::Display for DomainError {
@@ -76,6 +82,14 @@ impl fmt::Display for DomainError {
             ),
             Self::EpochExhausted => formatter.write_str("claim epoch space is exhausted"),
             Self::RevisionExhausted => formatter.write_str("goal revision space is exhausted"),
+            Self::InvalidDuration => formatter.write_str("duration must be greater than zero"),
+            Self::InvalidLeaseDeadline => {
+                formatter.write_str("lease deadline must not precede the current instant")
+            }
+            Self::TimeOverflow => formatter.write_str("monotonic time arithmetic overflowed"),
+            Self::InvalidNumericValue { kind } => {
+                write!(formatter, "{kind} value is outside its valid range")
+            }
         }
     }
 }

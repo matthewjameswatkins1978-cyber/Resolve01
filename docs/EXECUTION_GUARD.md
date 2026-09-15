@@ -16,5 +16,28 @@ Issuance reserves exact scope keys. Admission promotes those reservations to
 held locks atomically with the outstanding action reference. Held locks are
 not released by worker lease expiry or guard-token expiry.
 
-S0 establishes the documented boundary only. Guard mechanics are delivered in
-S3, after the domain and persistence sections have been merged.
+S3 implements the guard boundary in `resolve-core` and the synchronous SQLite
+operations in `resolve-store`. `ScopeKey` values are validated only for being
+non-empty, then sorted and de-duplicated by exact equality. Resolve does not
+interpret their resource meaning.
+
+Issuance requires the commitment to be `Claimed` or `Working`, the requesting
+worker and typed epoch to match the current claim, the claim to belong to the
+store's current explicit `BootGeneration`, and the commitment to have no
+outstanding action. The reservation deadline is the earlier of the supplied
+guard TTL and claim-lease deadline. Scope availability and reservation rows
+are established in one `BEGIN IMMEDIATE` transaction.
+
+Admission requires the guard to be issued, unexpired, current-boot, and still
+backed by every exact reserved scope row. It promotes all reservations to
+`Held`, records the typed action reference on the commitment, and appends
+`GuardAdmitted` atomically. Repeating the same admission is idempotent; a
+different action or scope set is rejected. Explicit invalidation is available
+for an unadmitted current-claim guard. Expired reservations are invalidated
+reactively during relevant scope operations and append
+`GuardReservationExpired`; no background sweeper exists.
+
+`GuardState::Resolved` and `GuardState::Uncertain` are present as typed domain
+states for the frozen R0 vocabulary, but outcome handling and recovery remain
+S4 work. S3 does not execute actions, apply Tethers policy, release held locks
+on outcomes, or implement restart recovery.

@@ -29,6 +29,8 @@ operations validate the current worker and claim epoch before changing state.
 an epoch supplied by a worker.
 
 The full transition contract, including lease expiry, restart invalidation,
-waiting reasons, and recovery, is frozen by Issue #1. S1 does not implement
-lease expiry, restart recovery, persistence, guard mechanics, structural
-planning, or event emission.
+waiting reasons, and recovery, is frozen by Issue #1. S1 establishes the
+commitment transitions; S2 adds persistence; S3 adds fencing and records an
+outstanding action only through the atomic guard-admission boundary. Lease
+expiry, restart recovery, outcome handling, structural planning, and service
+layers remain unimplemented.

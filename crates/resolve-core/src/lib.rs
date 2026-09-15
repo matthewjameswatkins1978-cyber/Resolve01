@@ -2,6 +2,7 @@
 
 pub mod domain;
 pub mod error;
+pub mod guards;
 mod state_machine;
 
 pub use domain::{
@@ -11,4 +12,7 @@ pub use domain::{
     TethersContractRef, TethersOutcome, Timestamp, WaitingReason, WorkEvent, WorkerId,
 };
 pub use error::DomainError;
+pub use guards::{
+    ExecutionGuard, GuardState, MonotonicDuration, ScopeKey, canonicalize_scope_keys,
+};
 pub use state_machine::ResumeTarget;

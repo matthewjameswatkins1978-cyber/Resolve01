@@ -1,6 +1,6 @@
 # Persistence
 
-S2 implements the synchronous SQLite persistence boundary in
+S2 and S3 implement the synchronous SQLite persistence boundary in
 `crates/resolve-store`. Resolve owns the operational snapshot and event
 records; this crate does not own Lantern history or Tethers execution state.
 
@@ -26,7 +26,9 @@ file-backed databases for WAL tests.
 
 ## Schema ownership
 
-Schema version `1` is recorded in `metadata`. S2 owns these tables:
+Schema version `2` is recorded in `metadata`. S3 migrates schema version 1 to
+2 transactionally without recreating or discarding S2 data. The store owns
+these tables:
 
 ```text
 metadata
@@ -38,14 +40,27 @@ commitment_acceptance_refs
 claims
 attention_items
 work_events
+execution_guards
+execution_guard_scopes
+scope_locks
 ```
+
+`metadata.boot_generation` is explicit store context. Claims persist the boot
+generation under which they were recorded; guard issuance and admission reject
+claims or guards from another generation. Restart invalidation itself remains
+S4 work.
 
 Goals and commitments carry store-owned `state_version` values. Goal revision
 rows are append-only. Prerequisites and acceptance references are normalized
 rows, while commitment state is stored as a private tagged JSON projection so
 waiting-reason variants retain their type.
 
-S2 deliberately does not create `execution_guards` or `scope_locks` tables.
+`execution_guards` stores the typed lifecycle projection and reservation
+deadline. `execution_guard_scopes` stores the canonical exact scope set.
+`scope_locks` has one row per exact key and distinguishes short-lived
+`reserved` locks from indefinite `held` locks with SQL checks. A migration
+failure rolls back its DDL and metadata version update. Reopening schema v2 is
+idempotent; newer schema versions fail closed.
 
 ## Atomic mutation boundary
 
@@ -61,6 +76,12 @@ Existing aggregate changes require the caller's expected `state_version`; a
 stale value returns `StoreError::VersionConflict` and never appends an event.
 The store never silently performs last-writer-wins updates and does not use a
 claim epoch as a substitute for the independent snapshot version.
+
+Guard issuance, reactive reservation expiry, and admission use one
+`BEGIN IMMEDIATE` transaction. Admission promotes reservations and records the
+commitment's outstanding action in the same transaction as `GuardAdmitted`.
+Held locks are not released by worker lease expiry. S3 contains no outcome,
+recovery, restart, or background-sweeper behavior.
 
 ## Read projections and restoration boundary
 
