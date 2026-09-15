@@ -303,6 +303,14 @@ impl CommitmentState {
     pub fn is_terminal(&self) -> bool {
         matches!(self, Self::Completed | Self::Cancelled | Self::Abandoned)
     }
+
+    /// States whose operational meaning includes a live worker claim.
+    pub fn requires_active_claim(&self) -> bool {
+        matches!(
+            self,
+            Self::Claimed | Self::Working | Self::CompletionProposed
+        ) || matches!(self, Self::Waiting(reason) if !reason.is_uncertain_action())
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -362,23 +370,15 @@ impl Commitment {
             epoch,
             last_heartbeat,
         });
-        if let (Some(high_water), Some(claim)) = (last_claim_epoch, claim.as_ref())
-            && claim.epoch() > high_water
+        if claim
+            .as_ref()
+            .is_some_and(|active_claim| Some(active_claim.epoch()) != last_claim_epoch)
         {
             return Err(DomainError::InvalidRestoredState {
-                reason: "active claim epoch exceeds the durable high-water mark",
+                reason: "active claim epoch must equal the durable high-water mark",
             });
         }
-        let claim_required = matches!(
-            state,
-            CommitmentState::Claimed
-                | CommitmentState::Working
-                | CommitmentState::CompletionProposed
-        ) || matches!(
-            state,
-            CommitmentState::Waiting(ref reason) if !reason.is_uncertain_action()
-        );
-        if claim_required != claim.is_some() {
+        if state.requires_active_claim() != claim.is_some() {
             return Err(DomainError::InvalidRestoredState {
                 reason: "commitment state and active claim disagree",
             });
@@ -505,7 +505,12 @@ impl Commitment {
         reason: WaitingReason,
     ) -> Result<(), DomainError> {
         self.require_current_claim(worker_id, epoch)?;
-        self.transition_to(CommitmentState::Waiting(reason))
+        let uncertain = reason.is_uncertain_action();
+        self.transition_to(CommitmentState::Waiting(reason))?;
+        if uncertain {
+            self.claim = None;
+        }
+        Ok(())
     }
 
     pub fn resume(
@@ -867,6 +872,54 @@ mod tests {
     }
 
     #[test]
+    fn restored_active_claim_must_match_epoch_high_water_exactly() {
+        let commitment = commitment();
+        let claim = (
+            worker("worker-1"),
+            ClaimEpoch::initial(),
+            MonotonicInstant::from_ticks(10),
+        );
+        let restore = |claim: Option<(WorkerId, ClaimEpoch, MonotonicInstant)>, high_water| {
+            Commitment::restore(
+                commitment.commitment_id().clone(),
+                commitment.goal_id().clone(),
+                commitment.parent_id().cloned(),
+                commitment.description(),
+                CommitmentState::Claimed,
+                commitment.prerequisites().to_vec(),
+                commitment.acceptance_refs().to_vec(),
+                claim,
+                None,
+                high_water,
+            )
+        };
+
+        assert!(restore(Some(claim.clone()), Some(ClaimEpoch::initial())).is_ok());
+        assert!(matches!(
+            restore(Some(claim.clone()), None),
+            Err(DomainError::InvalidRestoredState { .. })
+        ));
+        assert!(matches!(
+            restore(
+                Some(claim.clone()),
+                Some(ClaimEpoch::try_from_raw(2).expect("epoch is valid")),
+            ),
+            Err(DomainError::InvalidRestoredState { .. })
+        ));
+        assert!(matches!(
+            restore(
+                Some((
+                    claim.0,
+                    ClaimEpoch::try_from_raw(2).expect("epoch is valid"),
+                    claim.2,
+                )),
+                Some(ClaimEpoch::initial())
+            ),
+            Err(DomainError::InvalidRestoredState { .. })
+        ));
+    }
+
+    #[test]
     fn waiting_reasons_and_uncertain_outcomes_remain_distinct() {
         let prerequisite = WaitingReason::Prerequisite(
             CommitmentId::try_new("commitment-2").expect("test identifier is valid"),
@@ -904,6 +957,7 @@ mod tests {
                 ),
             )
             .expect("uncertain waiting is representable");
+        assert!(commitment.claim().is_none());
 
         let error = commitment
             .resume(claim.worker_id(), claim.epoch(), ResumeTarget::Working)

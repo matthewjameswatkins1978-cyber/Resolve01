@@ -35,6 +35,10 @@ descriptions, prerequisite and acceptance slices, state, claim, and
 outstanding-action references through read-only accessors. The outstanding
 action is intentionally read-only; S4 changes it only through the controlled
 guard/outcome lifecycle at the store boundary.
+`CommitmentState::requires_active_claim()` is the shared domain rule for claim
+ownership: `CLAIMED`, `WORKING`, ordinary `WAITING`, and
+`COMPLETION_PROPOSED` require a live claim, while
+`WAITING(UncertainAction(...))` is deliberately claimless.
 
 `Prerequisite` has exactly the three R0 forms: commitment, Tethers
 verification, and human decision. `WaitingReason` keeps prerequisite,

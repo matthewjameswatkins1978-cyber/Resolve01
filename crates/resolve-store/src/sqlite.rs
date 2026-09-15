@@ -192,6 +192,7 @@ struct CommitmentContext {
     state_json: String,
     outstanding_action: Option<String>,
     state_version: i64,
+    last_claim_epoch: Option<i64>,
     claim_epoch: Option<i64>,
     worker: Option<String>,
     boot_generation: Option<i64>,
@@ -632,16 +633,20 @@ impl SqliteStore {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let (goal_id, state_json, outstanding_action): (String, String, Option<String>) =
-            transaction
-                .query_row(
-                    "SELECT goal_id, state_json, outstanding_action
+        let (goal_id, state_json, last_claim_epoch, outstanding_action): (
+            String,
+            String,
+            Option<i64>,
+            Option<String>,
+        ) = transaction
+            .query_row(
+                "SELECT goal_id, state_json, last_claim_epoch, outstanding_action
                      FROM commitments WHERE commitment_id = ?1",
-                    params![commitment_id.as_ref()],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-                )
-                .optional()?
-                .ok_or_else(|| not_found("commitment", commitment_id.to_string()))?;
+                params![commitment_id.as_ref()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()?
+            .ok_or_else(|| not_found("commitment", commitment_id.to_string()))?;
         let state = decode_commitment_state(&state_json)?;
         if !matches!(state, CommitmentState::Claimed | CommitmentState::Working) {
             return Err(StoreError::GuardInvalid {
@@ -683,6 +688,12 @@ impl SqliteStore {
                 commitment_id: commitment_id.to_string(),
                 reason: format!("claim epoch is {stored_epoch}, not {claim_epoch}"),
             });
+        }
+        let stored_last_claim_epoch = last_claim_epoch.map(ClaimEpoch::try_from_raw).transpose()?;
+        if stored_last_claim_epoch != Some(claim_epoch) {
+            return Err(StoreError::InvalidPersistedData(
+                "active claim epoch does not equal the durable high-water mark".to_owned(),
+            ));
         }
         let current_boot_generation = current_boot_generation(&transaction)?;
         if stored_boot_generation
@@ -863,7 +874,7 @@ impl SqliteStore {
         let commitment = transaction
             .query_row(
                 "SELECT c.goal_id, c.state_json, c.outstanding_action, c.state_version,
-                        cl.claim_epoch, cl.worker_id, cl.boot_generation
+                        c.last_claim_epoch, cl.claim_epoch, cl.worker_id, cl.boot_generation
                  FROM commitments c
                  LEFT JOIN claims cl ON cl.commitment_id = c.commitment_id
                  WHERE c.commitment_id = ?1",
@@ -874,9 +885,10 @@ impl SqliteStore {
                         state_json: row.get(1)?,
                         outstanding_action: row.get(2)?,
                         state_version: row.get(3)?,
-                        claim_epoch: row.get(4)?,
-                        worker: row.get(5)?,
-                        boot_generation: row.get(6)?,
+                        last_claim_epoch: row.get(4)?,
+                        claim_epoch: row.get(5)?,
+                        worker: row.get(6)?,
+                        boot_generation: row.get(7)?,
                     })
                 },
             )
@@ -909,6 +921,15 @@ impl SqliteStore {
                     guard.claim_epoch
                 ),
             });
+        }
+        let last_claim_epoch = commitment
+            .last_claim_epoch
+            .map(ClaimEpoch::try_from_raw)
+            .transpose()?;
+        if last_claim_epoch != Some(guard.claim_epoch) {
+            return Err(StoreError::InvalidPersistedData(
+                "active claim epoch does not equal the durable high-water mark".to_owned(),
+            ));
         }
         let _worker = commitment
             .worker
@@ -1119,22 +1140,32 @@ impl SqliteStore {
         worker_id: &WorkerId,
         epoch: ClaimEpoch,
         now: MonotonicInstant,
+        claim_lease_duration: MonotonicDuration,
     ) -> Result<HeartbeatResult, StoreError> {
         let now_ticks = checked_i64(now.ticks(), "current monotonic instant")?;
         let epoch_ticks = checked_i64(epoch.value(), "claim epoch")?;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let (goal_id, state_json, stored_worker, stored_epoch, heartbeat, boot): (
+        let (
+            goal_id,
+            state_json,
+            last_claim_epoch,
+            stored_worker,
+            stored_epoch,
+            heartbeat,
+            boot,
+        ): (
             String,
             String,
+            Option<i64>,
             String,
             i64,
             i64,
             i64,
         ) = transaction
             .query_row(
-                "SELECT c.goal_id, c.state_json,
+                "SELECT c.goal_id, c.state_json, c.last_claim_epoch,
                         cl.worker_id, cl.claim_epoch, cl.last_heartbeat,
                         cl.boot_generation
                  FROM commitments c JOIN claims cl ON cl.commitment_id = c.commitment_id
@@ -1148,6 +1179,7 @@ impl SqliteStore {
                         row.get(3)?,
                         row.get(4)?,
                         row.get(5)?,
+                        row.get(6)?,
                     ))
                 },
             )
@@ -1157,7 +1189,7 @@ impl SqliteStore {
                 reason: "commitment has no current claim".to_owned(),
             })?;
         let state = decode_commitment_state(&state_json)?;
-        if !matches!(state, CommitmentState::Claimed | CommitmentState::Working) {
+        if !state.requires_active_claim() {
             return Err(StoreError::ClaimMismatch {
                 commitment_id: commitment_id.to_string(),
                 reason: format!("heartbeats are not valid in {state:?}"),
@@ -1173,12 +1205,26 @@ impl SqliteStore {
                 reason: "heartbeat does not match the current worker, epoch, or boot".to_owned(),
             });
         }
-        if now_ticks < heartbeat {
+        let last_claim_epoch = last_claim_epoch.map(ClaimEpoch::try_from_raw).transpose()?;
+        if last_claim_epoch != Some(epoch) {
+            return Err(StoreError::InvalidPersistedData(
+                "active claim epoch does not equal the durable high-water mark".to_owned(),
+            ));
+        }
+        let heartbeat_ticks = heartbeat;
+        let heartbeat = MonotonicInstant::try_from_raw(heartbeat_ticks)?;
+        let claim_lease_deadline = claim_lease_duration.deadline_from(heartbeat)?;
+        if claim_lease_deadline <= now {
+            return Err(StoreError::LeaseExpired {
+                commitment_id: commitment_id.to_string(),
+            });
+        }
+        if now_ticks < heartbeat_ticks {
             return Err(StoreError::InvalidMutation(
                 "claim heartbeat cannot move backwards".to_owned(),
             ));
         }
-        if now_ticks == heartbeat {
+        if now == heartbeat {
             return Ok(HeartbeatResult::AlreadyCurrent);
         }
         let changed = transaction.execute(
@@ -1190,7 +1236,7 @@ impl SqliteStore {
                 commitment_id.as_ref(),
                 worker_id.as_ref(),
                 epoch_ticks,
-                heartbeat
+                heartbeat_ticks
             ],
         )?;
         if changed != 1 {
@@ -1228,7 +1274,7 @@ impl SqliteStore {
         let current_boot_ticks = checked_i64(current_boot.value(), "boot generation")?;
         let mut statement = transaction.prepare(
             "SELECT c.commitment_id, c.goal_id, c.state_json, c.outstanding_action,
-                    c.state_version, cl.worker_id, cl.claim_epoch,
+                    c.state_version, c.last_claim_epoch, cl.worker_id, cl.claim_epoch,
                     cl.last_heartbeat, cl.boot_generation
              FROM commitments c JOIN claims cl ON cl.commitment_id = c.commitment_id
              ORDER BY c.commitment_id",
@@ -1242,10 +1288,11 @@ impl SqliteStore {
                 row.get::<_, String>(2)?,
                 row.get::<_, Option<String>>(3)?,
                 row.get::<_, i64>(4)?,
-                row.get::<_, String>(5)?,
-                row.get::<_, i64>(6)?,
+                row.get::<_, Option<i64>>(5)?,
+                row.get::<_, String>(6)?,
                 row.get::<_, i64>(7)?,
                 row.get::<_, i64>(8)?,
+                row.get::<_, i64>(9)?,
             ));
         }
         drop(rows);
@@ -1257,6 +1304,7 @@ impl SqliteStore {
             state_json,
             outstanding_action,
             version,
+            last_claim_epoch,
             worker_id,
             epoch,
             heartbeat,
@@ -1270,20 +1318,26 @@ impl SqliteStore {
                 });
             }
             let state = decode_commitment_state(&state_json)?;
-            if !matches!(state, CommitmentState::Claimed | CommitmentState::Working) {
+            if !state.requires_active_claim() {
                 return Err(StoreError::InvalidPersistedData(format!(
                     "claim exists in invalid commitment state {state:?}"
                 )));
             }
             let epoch = ClaimEpoch::try_from_raw(epoch)?;
+            let last_claim_epoch = last_claim_epoch.map(ClaimEpoch::try_from_raw).transpose()?;
+            if last_claim_epoch != Some(epoch) {
+                return Err(StoreError::InvalidPersistedData(
+                    "active claim epoch does not equal the durable high-water mark".to_owned(),
+                ));
+            }
             let heartbeat = MonotonicInstant::try_from_raw(heartbeat)?;
             let deadline = claim_lease_duration.deadline_from(heartbeat)?;
             if deadline > now {
                 continue;
             }
-            if outstanding_action.is_some() && matches!(state, CommitmentState::Claimed) {
+            if outstanding_action.is_some() && !matches!(state, CommitmentState::Working) {
                 return Err(StoreError::InvalidPersistedData(
-                    "claimed commitment has an outstanding action".to_owned(),
+                    "claim-bearing commitment has an outstanding action outside WORKING".to_owned(),
                 ));
             }
             let next_version = next_state_version(version)?;
@@ -1687,14 +1741,14 @@ impl SqliteStore {
                 )));
             }
             let state = decode_commitment_state(&state_json)?;
-            if !matches!(state, CommitmentState::Claimed | CommitmentState::Working) {
+            if !state.requires_active_claim() {
                 return Err(StoreError::InvalidPersistedData(format!(
                     "claim for commitment {commitment_id:?} exists in {state:?}"
                 )));
             }
-            if outstanding_action.is_some() && matches!(state, CommitmentState::Claimed) {
+            if outstanding_action.is_some() && !matches!(state, CommitmentState::Working) {
                 return Err(StoreError::InvalidPersistedData(
-                    "CLAIMED commitment has an outstanding action".to_owned(),
+                    "claim-bearing commitment has an outstanding action outside WORKING".to_owned(),
                 ));
             }
             let commitment_id = parse_id(commitment_id, "commitment", CommitmentId::try_new)?;
@@ -1702,9 +1756,9 @@ impl SqliteStore {
             let worker_id = parse_id(worker_id, "worker", WorkerId::try_new)?;
             let epoch = ClaimEpoch::try_from_raw(epoch)?;
             let last_claim_epoch = last_claim_epoch.map(ClaimEpoch::try_from_raw).transpose()?;
-            if last_claim_epoch.is_none_or(|high_water| epoch > high_water) {
+            if last_claim_epoch != Some(epoch) {
                 return Err(StoreError::InvalidPersistedData(
-                    "active claim exceeds the claim epoch high-water mark".to_owned(),
+                    "active claim epoch does not equal the claim epoch high-water mark".to_owned(),
                 ));
             }
             let recovery_state = encode_commitment_state(&CommitmentState::RecoveryPending)?;
@@ -1736,6 +1790,50 @@ impl SqliteStore {
                 0,
             )?;
             let _ = (worker_id, epoch);
+        }
+
+        let mut commitment_statement = transaction.prepare(
+            "SELECT c.commitment_id, c.state_json, c.outstanding_action,
+                    cl.commitment_id IS NOT NULL
+             FROM commitments c
+             LEFT JOIN claims cl ON cl.commitment_id = c.commitment_id
+             ORDER BY c.commitment_id",
+        )?;
+        let mut commitment_rows = commitment_statement.query([])?;
+        let mut restored_commitments = Vec::new();
+        while let Some(row) = commitment_rows.next()? {
+            restored_commitments.push((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, bool>(3)?,
+            ));
+        }
+        drop(commitment_rows);
+        drop(commitment_statement);
+        for (commitment_id, state_json, outstanding_action, has_claim) in restored_commitments {
+            if has_claim {
+                return Err(StoreError::InvalidPersistedData(format!(
+                    "active claim for commitment {commitment_id:?} survived startup recovery"
+                )));
+            }
+            let state = decode_commitment_state(&state_json)?;
+            if state.requires_active_claim() {
+                return Err(StoreError::InvalidPersistedData(format!(
+                    "commitment {commitment_id:?} in {state:?} has no active claim"
+                )));
+            }
+            if outstanding_action.is_some()
+                && !matches!(
+                    &state,
+                    CommitmentState::RecoveryPending
+                        | CommitmentState::Waiting(WaitingReason::UncertainAction(_))
+                )
+            {
+                return Err(StoreError::InvalidPersistedData(format!(
+                    "commitment {commitment_id:?} has an outstanding action in {state:?}"
+                )));
+            }
         }
 
         let mut issued_statement = transaction.prepare(
@@ -1830,9 +1928,9 @@ impl SqliteStore {
                     |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
                 )?;
             let high_water = last_claim_epoch.map(ClaimEpoch::try_from_raw).transpose()?;
-            if high_water.is_none_or(|high_water| guard.claim_epoch > high_water) {
+            if high_water != Some(guard.claim_epoch) {
                 return Err(StoreError::InvalidPersistedData(
-                    "active guard exceeds the claim epoch high-water mark".to_owned(),
+                    "active guard epoch does not equal the claim epoch high-water mark".to_owned(),
                 ));
             }
             let state = decode_commitment_state(&state_json)?;
@@ -1844,10 +1942,7 @@ impl SqliteStore {
             }
             match guard.state {
                 GuardState::Admitted { .. }
-                    if !matches!(
-                        state,
-                        CommitmentState::Working | CommitmentState::RecoveryPending
-                    ) =>
+                    if !matches!(state, CommitmentState::RecoveryPending) =>
                 {
                     return Err(StoreError::RecoveryBlocked {
                         commitment_id: commitment_id_typed.to_string(),
@@ -2043,6 +2138,35 @@ impl SqliteStore {
                 },
             )
             .transpose()?;
+        let state = decode_commitment_state(&state_json)?;
+        let last_claim_epoch = last_claim_epoch
+            .map(|value| positive_u64(value, "last claim epoch"))
+            .transpose()?;
+        if claim
+            .as_ref()
+            .is_some_and(|active_claim| Some(active_claim.epoch()) != last_claim_epoch)
+        {
+            return Err(StoreError::InvalidPersistedData(
+                "active claim epoch does not equal the durable high-water mark".to_owned(),
+            ));
+        }
+        if state.requires_active_claim() != claim.is_some() {
+            return Err(StoreError::InvalidPersistedData(
+                "commitment state and active claim disagree".to_owned(),
+            ));
+        }
+        if outstanding_action.is_some()
+            && !matches!(
+                &state,
+                CommitmentState::Working
+                    | CommitmentState::RecoveryPending
+                    | CommitmentState::Waiting(WaitingReason::UncertainAction(_))
+            )
+        {
+            return Err(StoreError::InvalidPersistedData(
+                "outstanding action disagrees with commitment state".to_owned(),
+            ));
+        }
         Ok(CommitmentRecord {
             commitment_id: parse_id(stored_id, "commitment", CommitmentId::try_new)?,
             goal_id: parse_id(goal_id, "goal", GoalId::try_new)?,
@@ -2050,13 +2174,11 @@ impl SqliteStore {
                 .map(|value| parse_id(value, "parent commitment", CommitmentId::try_new))
                 .transpose()?,
             description,
-            state: decode_commitment_state(&state_json)?,
+            state,
             prerequisites: self.load_prerequisites(commitment_id)?,
             acceptance_refs: self.load_acceptance_refs(commitment_id)?,
             claim,
-            last_claim_epoch: last_claim_epoch
-                .map(|value| positive_u64(value, "last claim epoch"))
-                .transpose()?,
+            last_claim_epoch,
             outstanding_action: outstanding_action
                 .map(|value| parse_id(value, "Tethers action", TethersActionRef::try_new))
                 .transpose()?,

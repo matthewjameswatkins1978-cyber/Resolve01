@@ -36,6 +36,12 @@ action may be explicitly released from recovery to `READY`, recording
 An admitted action may remain outstanding in `RECOVERY_PENDING` until its
 authoritative Tethers outcome is recorded.
 
+`WAITING` for any ordinary reason and `COMPLETION_PROPOSED` also retain their
+active claim. Heartbeats are valid in every claim-bearing state, and lease
+expiry or restart moves them to `RECOVERY_PENDING` while preserving the epoch
+high-water mark. `WAITING(UncertainAction(...))` is the exception: it has no
+active claim and cannot transition to `RECOVERY_PENDING` through this path.
+
 Guard issuance may reserve scope while a commitment is `CLAIMED`, preserving
 the pre-admission fence. Consequential Tethers admission requires the
 commitment to have explicitly entered `WORKING`; admission does not perform the

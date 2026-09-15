@@ -1,7 +1,8 @@
 use resolve_core::{
     ClaimEpoch, ClaimLease, Commitment, CommitmentId, CommitmentState, ExecutionGuard, GoalId,
     GoalRevision, GoalSpec, GoalState, GuardId, GuardState, MonotonicDuration, MonotonicInstant,
-    ScopeKey, ScopeSet, TethersActionRef, TethersOutcome, Timestamp, WorkEvent, WorkerId,
+    ScopeKey, ScopeSet, TethersActionRef, TethersOutcome, Timestamp, WaitingReason, WorkEvent,
+    WorkerId,
 };
 use resolve_store::{
     GuardIssueRequest, HeartbeatResult, OutcomeRecording, SqliteStore, StoreError,
@@ -441,6 +442,7 @@ fn heartbeat_is_monotonic_and_expiry_is_transactional() {
                 claim.worker_id(),
                 claim.epoch(),
                 MonotonicInstant::from_ticks(15),
+                MonotonicDuration::try_from_ticks(10).expect("duration valid"),
             )
             .expect("heartbeat records"),
         HeartbeatResult::Recorded
@@ -452,6 +454,7 @@ fn heartbeat_is_monotonic_and_expiry_is_transactional() {
                 claim.worker_id(),
                 claim.epoch(),
                 MonotonicInstant::from_ticks(15),
+                MonotonicDuration::try_from_ticks(10).expect("duration valid"),
             )
             .expect("duplicate heartbeat is idempotent"),
         HeartbeatResult::AlreadyCurrent
@@ -462,6 +465,7 @@ fn heartbeat_is_monotonic_and_expiry_is_transactional() {
             claim.worker_id(),
             claim.epoch(),
             MonotonicInstant::from_ticks(14),
+            MonotonicDuration::try_from_ticks(10).expect("duration valid"),
         )
         .expect_err("backwards heartbeat is rejected");
     assert!(matches!(error, StoreError::InvalidMutation(_)));
@@ -481,6 +485,265 @@ fn heartbeat_is_monotonic_and_expiry_is_transactional() {
             .state(),
         &CommitmentState::RecoveryPending
     );
+}
+
+#[test]
+fn late_heartbeat_cannot_resurrect_an_expired_claim() {
+    let mut store = SqliteStore::open_in_memory_for_tests().expect("store opens");
+    setup_goal(&mut store);
+    let (commitment, claim) = setup_working(&mut store, "commitment-1");
+    store
+        .record_heartbeat(
+            commitment.commitment_id(),
+            claim.worker_id(),
+            claim.epoch(),
+            MonotonicInstant::from_ticks(15),
+            MonotonicDuration::try_from_ticks(10).expect("duration valid"),
+        )
+        .expect("live heartbeat records");
+    let event_count = store.list_events().expect("events load").len();
+    let error = store
+        .record_heartbeat(
+            commitment.commitment_id(),
+            claim.worker_id(),
+            claim.epoch(),
+            MonotonicInstant::from_ticks(25),
+            MonotonicDuration::try_from_ticks(10).expect("duration valid"),
+        )
+        .expect_err("heartbeat at the exact lease deadline is expired");
+    assert!(matches!(error, StoreError::LeaseExpired { .. }));
+    assert_eq!(store.list_events().expect("events load").len(), event_count);
+    assert_eq!(
+        store
+            .load_commitment_record(commitment.commitment_id())
+            .expect("commitment loads")
+            .claim()
+            .expect("claim remains current")
+            .last_heartbeat(),
+        15
+    );
+}
+
+#[test]
+fn waiting_claim_expires_to_recovery_and_next_epoch_is_allowed() {
+    let mut store = SqliteStore::open_in_memory_for_tests().expect("store opens");
+    setup_goal(&mut store);
+    let (mut commitment, claim) = setup_working(&mut store, "commitment-waiting");
+    commitment
+        .wait(
+            claim.worker_id(),
+            claim.epoch(),
+            WaitingReason::External("awaiting input".to_owned()),
+        )
+        .expect("working commitment waits");
+    store
+        .persist_commitment_change(
+            &commitment,
+            4,
+            &WorkEvent::CommitmentWaiting {
+                commitment_id: commitment.commitment_id().clone(),
+                reason: WaitingReason::External("awaiting input".to_owned()),
+            },
+            5,
+        )
+        .expect("waiting state persists");
+    store
+        .record_heartbeat(
+            commitment.commitment_id(),
+            claim.worker_id(),
+            claim.epoch(),
+            MonotonicInstant::from_ticks(15),
+            MonotonicDuration::try_from_ticks(10).expect("duration valid"),
+        )
+        .expect("waiting claim heartbeat records");
+    assert_eq!(
+        store
+            .process_expired_claims(
+                MonotonicInstant::from_ticks(25),
+                MonotonicDuration::try_from_ticks(10).expect("duration valid"),
+            )
+            .expect("waiting claim expires"),
+        1
+    );
+    let restored = store
+        .load_commitment(&commitment_id("commitment-waiting"))
+        .expect("recovery-pending commitment restores");
+    assert_eq!(restored.state(), &CommitmentState::RecoveryPending);
+    assert!(restored.claim().is_none());
+    assert_eq!(restored.last_claim_epoch(), Some(ClaimEpoch::initial()));
+    store
+        .recover_without_action(&commitment_id("commitment-waiting"), 30)
+        .expect("recovery releases commitment");
+    let mut next = store
+        .load_commitment(&commitment_id("commitment-waiting"))
+        .expect("ready commitment restores");
+    let next_claim = next
+        .claim_for(worker_id("worker-2"), MonotonicInstant::from_ticks(31))
+        .expect("next claim succeeds");
+    assert_eq!(next_claim.epoch().value(), 2);
+}
+
+#[test]
+fn completion_proposed_claim_expires_to_recovery() {
+    let mut store = SqliteStore::open_in_memory_for_tests().expect("store opens");
+    setup_goal(&mut store);
+    let (mut commitment, claim) = setup_working(&mut store, "commitment-completion");
+    commitment
+        .propose_completion(claim.worker_id(), claim.epoch())
+        .expect("completion proposal succeeds");
+    store
+        .persist_commitment_change(
+            &commitment,
+            4,
+            &WorkEvent::CommitmentCompletionProposed {
+                commitment_id: commitment.commitment_id().clone(),
+            },
+            5,
+        )
+        .expect("completion proposal persists");
+    store
+        .record_heartbeat(
+            commitment.commitment_id(),
+            claim.worker_id(),
+            claim.epoch(),
+            MonotonicInstant::from_ticks(15),
+            MonotonicDuration::try_from_ticks(10).expect("duration valid"),
+        )
+        .expect("completion proposal heartbeat records");
+    assert_eq!(
+        store
+            .process_expired_claims(
+                MonotonicInstant::from_ticks(25),
+                MonotonicDuration::try_from_ticks(10).expect("duration valid"),
+            )
+            .expect("completion proposal claim expires"),
+        1
+    );
+    let restored = store
+        .load_commitment(&commitment_id("commitment-completion"))
+        .expect("recovery-pending commitment restores");
+    assert_eq!(restored.state(), &CommitmentState::RecoveryPending);
+    assert!(restored.claim().is_none());
+    assert_eq!(restored.last_claim_epoch(), Some(ClaimEpoch::initial()));
+}
+
+#[test]
+fn waiting_and_completion_proposed_claims_recover_on_restart() {
+    for (id, completion_proposed) in [
+        ("commitment-waiting-restart", false),
+        ("commitment-completion-restart", true),
+    ] {
+        let directory = tempdir().expect("temporary directory creates");
+        let path = directory.path().join("resolve.sqlite");
+        let mut store = SqliteStore::open(&path).expect("store opens");
+        setup_goal(&mut store);
+        let (mut commitment, claim) = setup_working(&mut store, id);
+        if completion_proposed {
+            commitment
+                .propose_completion(claim.worker_id(), claim.epoch())
+                .expect("completion proposal succeeds");
+            store
+                .persist_commitment_change(
+                    &commitment,
+                    4,
+                    &WorkEvent::CommitmentCompletionProposed {
+                        commitment_id: commitment.commitment_id().clone(),
+                    },
+                    5,
+                )
+                .expect("completion proposal persists");
+        } else {
+            commitment
+                .wait(
+                    claim.worker_id(),
+                    claim.epoch(),
+                    WaitingReason::External("awaiting input".to_owned()),
+                )
+                .expect("working commitment waits");
+            store
+                .persist_commitment_change(
+                    &commitment,
+                    4,
+                    &WorkEvent::CommitmentWaiting {
+                        commitment_id: commitment.commitment_id().clone(),
+                        reason: WaitingReason::External("awaiting input".to_owned()),
+                    },
+                    5,
+                )
+                .expect("waiting state persists");
+        }
+        drop(store);
+
+        let mut reopened = SqliteStore::open(&path).expect("startup recovery runs");
+        let restored = reopened
+            .load_commitment(&commitment_id(id))
+            .expect("recovered commitment restores");
+        assert_eq!(restored.state(), &CommitmentState::RecoveryPending);
+        assert!(restored.claim().is_none());
+        assert_eq!(restored.last_claim_epoch(), Some(ClaimEpoch::initial()));
+        reopened
+            .recover_without_action(&commitment_id(id), 30)
+            .expect("recovery releases commitment");
+        let mut next = reopened
+            .load_commitment(&commitment_id(id))
+            .expect("ready commitment restores");
+        assert_eq!(
+            next.claim_for(worker_id("worker-2"), MonotonicInstant::from_ticks(31))
+                .expect("next claim succeeds")
+                .epoch()
+                .value(),
+            2
+        );
+    }
+}
+
+#[test]
+fn startup_rejects_claim_epoch_that_does_not_match_high_water() {
+    let directory = tempdir().expect("temporary directory creates");
+    let path = directory.path().join("resolve.sqlite");
+    let mut store = SqliteStore::open(&path).expect("store opens");
+    setup_goal(&mut store);
+    setup_working(&mut store, "commitment-malformed-epoch");
+    drop(store);
+
+    let connection = Connection::open(&path).expect("database reopens");
+    connection
+        .execute(
+            "UPDATE commitments SET last_claim_epoch = 2
+             WHERE commitment_id = 'commitment-malformed-epoch'",
+            [],
+        )
+        .expect("malformed high-water mark is written");
+    drop(connection);
+
+    assert!(matches!(
+        SqliteStore::open(&path),
+        Err(StoreError::InvalidPersistedData(_))
+    ));
+}
+
+#[test]
+fn startup_rejects_claim_bearing_state_without_a_claim() {
+    let directory = tempdir().expect("temporary directory creates");
+    let path = directory.path().join("resolve.sqlite");
+    let mut store = SqliteStore::open(&path).expect("store opens");
+    setup_goal(&mut store);
+    setup_working(&mut store, "commitment-missing-claim");
+    drop(store);
+
+    let connection = Connection::open(&path).expect("database reopens");
+    connection
+        .execute(
+            "DELETE FROM claims WHERE commitment_id = 'commitment-missing-claim'",
+            [],
+        )
+        .expect("malformed claim row is removed");
+    drop(connection);
+
+    assert!(matches!(
+        SqliteStore::open(&path),
+        Err(StoreError::InvalidPersistedData(_))
+    ));
 }
 
 #[test]
