@@ -1,6 +1,6 @@
 # Commitment state machine
 
-S1 implements the frozen R0 commitment-state boundary in
+R0 implements the frozen commitment-state boundary in
 `crates/resolve-core/src/state_machine.rs` and the claimant operations on
 `Commitment`.
 
@@ -28,7 +28,7 @@ operations validate the current worker and claim epoch before changing state.
 (retaining it). `claim_for` creates the next typed epoch rather than accepting
 an epoch supplied by a worker.
 
-S4 adds the recovery boundary without adding new planning or execution states.
+The recovery boundary adds no new planning or execution states.
 An expired claim or a restart moves active `CLAIMED`/`WORKING` work to
 `RECOVERY_PENDING` and clears its active claim. A commitment with no outstanding
 action may be explicitly released from recovery to `READY`, recording
@@ -47,7 +47,7 @@ the pre-admission fence. Consequential Tethers admission requires the
 commitment to have explicitly entered `WORKING`; admission does not perform the
 `CLAIMED -> WORKING` transition.
 
-S5 structural planning does not add a state. A claim-fenced target may receive
+Structural planning does not add a state. A claim-fenced target may receive
 one of the three closed structural proposals: decomposition moves a working
 parent to `WAITING(Prerequisite(replacement_terminal))`, adding a prerequisite
 leaves the current state unchanged, and abandonment uses the existing terminal

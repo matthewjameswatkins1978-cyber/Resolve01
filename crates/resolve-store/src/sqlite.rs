@@ -502,6 +502,14 @@ impl SqliteStore {
         created_at: i64,
     ) -> Result<i64, StoreError> {
         validate_commitment_event(event, commitment.commitment_id(), "commitment creation")?;
+        if !matches!(commitment.state(), CommitmentState::Proposed)
+            || commitment.claim().is_some()
+            || commitment.outstanding_action().is_some()
+        {
+            return Err(StoreError::InvalidMutation(
+                "new commitments must begin Proposed without a claim or action".to_owned(),
+            ));
+        }
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -527,19 +535,64 @@ impl SqliteStore {
         let boot_generation = current_boot_generation(&transaction)?;
         let (
             current_version,
+            current_goal_id,
+            current_parent_id,
+            current_description,
             current_state_json,
             current_replacement_terminal_id,
             current_outstanding_action,
-        ): (i64, String, Option<String>, Option<String>) = transaction
+        ): (
+            i64,
+            String,
+            Option<String>,
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+        ) = transaction
             .query_row(
-                "SELECT state_version, state_json, replacement_terminal_id, outstanding_action
+                "SELECT state_version, goal_id, parent_id, description, state_json,
+                        replacement_terminal_id, outstanding_action
                  FROM commitments WHERE commitment_id = ?1",
                 params![commitment.commitment_id().as_ref()],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                    ))
+                },
             )
             .optional()?
             .ok_or_else(|| not_found("commitment", commitment.commitment_id().to_string()))?;
         let current_state = decode_commitment_state(&current_state_json)?;
+        ensure_version(
+            "commitment",
+            commitment.commitment_id().to_string(),
+            expected_state_version,
+            current_version,
+        )?;
+        if current_goal_id != commitment.goal_id().as_ref()
+            || current_parent_id.as_deref() != commitment.parent_id().map(AsRef::as_ref)
+            || current_description != commitment.description()
+        {
+            return Err(StoreError::InvalidMutation(
+                "generic commitment persistence cannot change identity or topology".to_owned(),
+            ));
+        }
+        if query_prerequisites_connection(&transaction, commitment.commitment_id())?
+            != commitment.prerequisites()
+            || query_acceptance_refs_connection(&transaction, commitment.commitment_id())?
+                != commitment.acceptance_refs()
+        {
+            return Err(StoreError::InvalidMutation(
+                "generic commitment persistence cannot change structural references".to_owned(),
+            ));
+        }
         if let Some(action_ref) = current_outstanding_action {
             return Err(StoreError::OutstandingAction {
                 commitment_id: commitment.commitment_id().to_string(),
@@ -558,12 +611,16 @@ impl SqliteStore {
             }
             .into());
         }
-        ensure_version(
-            "commitment",
-            commitment.commitment_id().to_string(),
-            expected_state_version,
-            current_version,
-        )?;
+        if commitment.outstanding_action().is_some() {
+            return Err(StoreError::InvalidMutation(
+                "generic commitment persistence cannot create an outstanding action".to_owned(),
+            ));
+        }
+        current_state.validate_transition_to(commitment.state())?;
+        validate_commitment_event_state(event, commitment.state())?;
+        let current_high_water =
+            current_last_claim_epoch(&transaction, commitment.commitment_id())?;
+        validate_claim_persistence(&transaction, commitment, &current_state, current_high_water)?;
         let next_state_version = next_state_version(expected_state_version)?;
         let event_id = append_event(&transaction, commitment.goal_id(), event, created_at)?;
         transaction.execute(
@@ -761,6 +818,50 @@ impl SqliteStore {
                 encode_attention_state(attention.state()),
             ],
         )?;
+        transaction.commit()?;
+        Ok(event_id)
+    }
+
+    /// Explicitly clear an open attention item and append its audit event.
+    pub fn clear_attention(
+        &mut self,
+        goal_id: &GoalId,
+        attention_id: &AttentionId,
+        created_at: i64,
+    ) -> Result<i64, StoreError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let state: String = transaction
+            .query_row(
+                "SELECT state FROM attention_items WHERE attention_id = ?1",
+                params![attention_id.as_ref()],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or_else(|| not_found("attention", attention_id.to_string()))?;
+        if decode_attention_state(&state)? != AttentionState::Open {
+            return Err(StoreError::InvalidMutation(
+                "attention item is already cleared".to_owned(),
+            ));
+        }
+        let event_id = append_event(
+            &transaction,
+            goal_id,
+            &WorkEvent::AttentionCleared {
+                attention_id: attention_id.clone(),
+            },
+            created_at,
+        )?;
+        if transaction.execute(
+            "UPDATE attention_items SET state = 'cleared' WHERE attention_id = ?1 AND state = 'open'",
+            params![attention_id.as_ref()],
+        )? != 1
+        {
+            return Err(StoreError::InvalidMutation(
+                "attention item changed while clearing".to_owned(),
+            ));
+        }
         transaction.commit()?;
         Ok(event_id)
     }
@@ -1888,6 +1989,7 @@ impl SqliteStore {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        validate_persisted_database(&transaction)?;
         let previous_boot = current_boot_generation(&transaction)?;
         let next_boot =
             BootGeneration::from_raw(previous_boot.value().checked_add(1).ok_or_else(|| {
@@ -2467,6 +2569,11 @@ impl SqliteStore {
             .optional()?
             .ok_or_else(|| not_found("attention", attention_id.to_string()))
             .and_then(|(stored_id, commitment_id, description, state)| {
+                if description.trim().is_empty() {
+                    return Err(StoreError::InvalidPersistedData(
+                        "attention description must not be empty".to_owned(),
+                    ));
+                }
                 Ok(AttentionRecord {
                     attention_id: parse_id(stored_id, "attention", AttentionId::try_new)?,
                     commitment_id: commitment_id
@@ -2577,6 +2684,270 @@ impl SqliteStore {
         }
         Ok(references)
     }
+}
+
+fn validate_persisted_database(transaction: &Transaction<'_>) -> Result<(), StoreError> {
+    let mut foreign_keys = transaction.prepare("PRAGMA foreign_key_check")?;
+    let mut rows = foreign_keys.query([])?;
+    if let Some(row) = rows.next()? {
+        let table: String = row.get(0)?;
+        let row_id: i64 = row.get(1)?;
+        let parent_table: String = row.get(2)?;
+        return Err(StoreError::InvalidPersistedData(format!(
+            "foreign-key violation in {table} row {row_id} referencing {parent_table}"
+        )));
+    }
+    drop(rows);
+    drop(foreign_keys);
+
+    let integrity: String =
+        transaction.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
+    if !integrity.eq_ignore_ascii_case("ok") {
+        return Err(StoreError::InvalidPersistedData(format!(
+            "SQLite integrity_check failed: {integrity}"
+        )));
+    }
+    validate_persisted_events(transaction)?;
+    validate_persisted_topology(transaction)?;
+    validate_guard_lock_consistency(transaction)
+}
+
+fn validate_persisted_events(transaction: &Transaction<'_>) -> Result<(), StoreError> {
+    let mut statement = transaction
+        .prepare("SELECT event_id, event_type, payload_json FROM work_events ORDER BY event_id")?;
+    let mut rows = statement.query([])?;
+    while let Some(row) = rows.next()? {
+        let event_id: i64 = row.get(0)?;
+        let event_type: String = row.get(1)?;
+        let payload_json: String = row.get(2)?;
+        let payload: StoredEventPayload = serde_json::from_str(&payload_json).map_err(|error| {
+            StoreError::InvalidPersistedData(format!(
+                "event {event_id} has invalid payload JSON: {error}"
+            ))
+        })?;
+        if event_type != stored_event_type(&payload) {
+            return Err(StoreError::InvalidPersistedData(format!(
+                "event {event_id} type {event_type:?} disagrees with its payload"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn stored_event_type(event: &StoredEventPayload) -> &'static str {
+    match event {
+        StoredEventPayload::GoalCreated { .. } => "goal_created",
+        StoredEventPayload::GoalRevised { .. } => "goal_revised",
+        StoredEventPayload::CommitmentCreated { .. } => "commitment_created",
+        StoredEventPayload::CommitmentActivated { .. } => "commitment_activated",
+        StoredEventPayload::CommitmentClaimed { .. } => "commitment_claimed",
+        StoredEventPayload::CommitmentStarted { .. } => "commitment_started",
+        StoredEventPayload::CommitmentWaiting { .. } => "commitment_waiting",
+        StoredEventPayload::CommitmentRecoveryPending { .. } => "commitment_recovery_pending",
+        StoredEventPayload::CommitmentCompletionProposed { .. } => "commitment_completion_proposed",
+        StoredEventPayload::CommitmentCompleted { .. } => "commitment_completed",
+        StoredEventPayload::CommitmentCancelled { .. } => "commitment_cancelled",
+        StoredEventPayload::CommitmentAbandoned { .. } => "commitment_abandoned",
+        StoredEventPayload::HeartbeatAccepted { .. } => "heartbeat_accepted",
+        StoredEventPayload::LeaseExpired { .. } => "lease_expired",
+        StoredEventPayload::GuardIssued { .. } => "guard_issued",
+        StoredEventPayload::GuardAdmitted { .. } => "guard_admitted",
+        StoredEventPayload::GuardInvalidated { .. } => "guard_invalidated",
+        StoredEventPayload::GuardReservationExpired { .. } => "guard_reservation_expired",
+        StoredEventPayload::TethersOutcomeRecorded { .. } => "tethers_outcome_recorded",
+        StoredEventPayload::RecoveryCompleted { .. } => "recovery_completed",
+        StoredEventPayload::RecoveryReleased { .. } => "recovery_released",
+        StoredEventPayload::StructuralProposalApplied { .. } => "structural_proposal_applied",
+        StoredEventPayload::AttentionRaised { .. } => "attention_raised",
+        StoredEventPayload::AttentionCleared { .. } => "attention_cleared",
+    }
+}
+
+fn validate_persisted_topology(transaction: &Transaction<'_>) -> Result<(), StoreError> {
+    let graph = load_dependency_graph(transaction)?;
+    let mut statement = transaction.prepare(
+        "SELECT commitment_id, goal_id, parent_id, replacement_terminal_id, state_json
+         FROM commitments ORDER BY commitment_id",
+    )?;
+    let mut rows = statement.query([])?;
+    let mut commitments = Vec::new();
+    while let Some(row) = rows.next()? {
+        commitments.push((
+            parse_id(row.get(0)?, "commitment", CommitmentId::try_new)?,
+            parse_id(row.get(1)?, "goal", GoalId::try_new)?,
+            row.get::<_, Option<String>>(2)?,
+            row.get::<_, Option<String>>(3)?,
+            decode_commitment_state(&row.get::<_, String>(4)?)?,
+        ));
+    }
+    drop(rows);
+    drop(statement);
+
+    let known: BTreeSet<_> = commitments.iter().map(|(id, ..)| id.clone()).collect();
+    for (commitment_id, goal_id, parent_id, replacement, state) in commitments {
+        if let Some(parent_id) = parent_id {
+            let parent_goal: String = transaction
+                .query_row(
+                    "SELECT goal_id FROM commitments WHERE commitment_id = ?1",
+                    params![parent_id.as_str()],
+                    |row| row.get(0),
+                )
+                .optional()?
+                .ok_or_else(|| {
+                    StoreError::InvalidPersistedData(
+                        "commitment parent reference is missing".to_owned(),
+                    )
+                })?;
+            if parent_goal != goal_id.as_ref() {
+                return Err(StoreError::InvalidPersistedData(
+                    "parent and child commitments have different goals".to_owned(),
+                ));
+            }
+        }
+        if let Some(replacement) = replacement {
+            let replacement_id =
+                parse_id(replacement, "replacement terminal", CommitmentId::try_new)?;
+            if !known.contains(&replacement_id) {
+                return Err(StoreError::InvalidPersistedData(
+                    "replacement terminal commitment is missing".to_owned(),
+                ));
+            }
+            let child = transaction.query_row(
+                "SELECT parent_id, goal_id FROM commitments WHERE commitment_id = ?1",
+                params![replacement_id.as_ref()],
+                |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, String>(1)?)),
+            )?;
+            if child.0.as_deref() != Some(commitment_id.as_ref()) || child.1 != goal_id.as_ref() {
+                return Err(StoreError::InvalidPersistedData(
+                    "replacement terminal is not a direct same-goal child".to_owned(),
+                ));
+            }
+            if !state.is_terminal()
+                && !matches!(
+                    &state,
+                    CommitmentState::Waiting(WaitingReason::Prerequisite(child))
+                        if child == &replacement_id
+                )
+                && !matches!(state, CommitmentState::RecoveryPending)
+            {
+                return Err(StoreError::InvalidPersistedData(
+                    "active composite barrier is not waiting on its replacement terminal"
+                        .to_owned(),
+                ));
+            }
+        }
+    }
+    let _ = graph;
+    Ok(())
+}
+
+fn validate_guard_lock_consistency(transaction: &Transaction<'_>) -> Result<(), StoreError> {
+    let mut statement =
+        transaction.prepare("SELECT guard_id FROM execution_guards ORDER BY guard_id")?;
+    let mut rows = statement.query([])?;
+    let mut guard_ids = Vec::new();
+    while let Some(row) = rows.next()? {
+        guard_ids.push(parse_id(row.get(0)?, "guard", GuardId::try_new)?);
+    }
+    drop(rows);
+    drop(statement);
+
+    for guard_id in guard_ids {
+        let guard = query_guard(transaction, &guard_id)?;
+        let scope_keys = query_guard_scopes(transaction, &guard_id)?;
+        let mut raw_scopes = Vec::new();
+        let mut scope_statement = transaction.prepare(
+            "SELECT scope_key FROM execution_guard_scopes
+             WHERE guard_id = ?1 ORDER BY ordinal",
+        )?;
+        let mut scope_rows = scope_statement.query(params![guard_id.as_ref()])?;
+        while let Some(row) = scope_rows.next()? {
+            raw_scopes.push(parse_id(row.get(0)?, "scope", ScopeKey::try_new)?);
+        }
+        drop(scope_rows);
+        drop(scope_statement);
+        if raw_scopes.as_slice() != scope_keys.as_slice() {
+            return Err(StoreError::InvalidPersistedData(format!(
+                "guard {guard_id} has a non-canonical or duplicate scope set"
+            )));
+        }
+
+        let mut lock_statement = transaction.prepare(
+            "SELECT scope_key, lock_state, action_ref, reservation_expires_at,
+                    commitment_id
+             FROM scope_locks WHERE guard_id = ?1 ORDER BY scope_key",
+        )?;
+        let mut lock_rows = lock_statement.query(params![guard_id.as_ref()])?;
+        let mut locks = Vec::new();
+        while let Some(row) = lock_rows.next()? {
+            locks.push((
+                parse_id(row.get(0)?, "scope", ScopeKey::try_new)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, Option<i64>>(3)?,
+                row.get::<_, String>(4)?,
+            ));
+        }
+        drop(lock_rows);
+        drop(lock_statement);
+        if locks.len() != scope_keys.len()
+            || locks
+                .iter()
+                .any(|(scope, _, _, _, _)| !scope_keys.as_slice().contains(scope))
+        {
+            return Err(StoreError::InvalidPersistedData(format!(
+                "guard {guard_id} scope locks do not exactly match its scope set"
+            )));
+        }
+        for scope_key in scope_keys.as_slice() {
+            let lock = locks
+                .iter()
+                .find(|(scope, ..)| scope == scope_key)
+                .ok_or_else(|| {
+                    StoreError::InvalidPersistedData(format!(
+                        "guard {guard_id} is missing a lock for scope {scope_key:?}"
+                    ))
+                })?;
+            let expected = match &guard.state {
+                GuardState::Issued => {
+                    if lock.1 != "reserved"
+                        || lock.2.is_some()
+                        || lock.3
+                            != guard
+                                .reservation_expires_at
+                                .map(|deadline| deadline.ticks() as i64)
+                    {
+                        return Err(StoreError::InvalidPersistedData(format!(
+                            "issued guard {guard_id} has an inconsistent reserved lock"
+                        )));
+                    }
+                    guard.commitment_id.as_ref()
+                }
+                GuardState::Admitted { action_ref } | GuardState::Uncertain { action_ref } => {
+                    if lock.1 != "held"
+                        || lock.2.as_deref() != Some(action_ref.as_ref())
+                        || lock.3.is_some()
+                    {
+                        return Err(StoreError::InvalidPersistedData(format!(
+                            "active guard {guard_id} has an inconsistent held lock"
+                        )));
+                    }
+                    guard.commitment_id.as_ref()
+                }
+                GuardState::Resolved { .. } | GuardState::Invalidated => {
+                    return Err(StoreError::InvalidPersistedData(format!(
+                        "terminal guard {guard_id} still has a scope lock"
+                    )));
+                }
+            };
+            if lock.4 != expected {
+                return Err(StoreError::InvalidPersistedData(format!(
+                    "guard {guard_id} lock has the wrong commitment"
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn checked_i64(value: u64, field: &str) -> Result<i64, StoreError> {
@@ -2995,6 +3366,183 @@ fn query_prerequisites_transaction(
         prerequisites.push(decode_prerequisite(row.get(0)?, row.get(1)?, row.get(2)?)?);
     }
     Ok(prerequisites)
+}
+
+fn query_prerequisites_connection(
+    transaction: &Transaction<'_>,
+    commitment_id: &CommitmentId,
+) -> Result<Vec<Prerequisite>, StoreError> {
+    query_prerequisites_transaction(transaction, commitment_id)
+}
+
+fn query_acceptance_refs_connection(
+    transaction: &Transaction<'_>,
+    commitment_id: &CommitmentId,
+) -> Result<Vec<AcceptanceRef>, StoreError> {
+    let mut statement = transaction.prepare(
+        "SELECT reference_id FROM commitment_acceptance_refs
+         WHERE commitment_id = ?1 ORDER BY ordinal",
+    )?;
+    let mut rows = statement.query(params![commitment_id.as_ref()])?;
+    let mut references = Vec::new();
+    while let Some(row) = rows.next()? {
+        references.push(parse_id(row.get(0)?, "acceptance", AcceptanceRef::try_new)?);
+    }
+    Ok(references)
+}
+
+fn current_last_claim_epoch(
+    transaction: &Transaction<'_>,
+    commitment_id: &CommitmentId,
+) -> Result<Option<ClaimEpoch>, StoreError> {
+    transaction
+        .query_row(
+            "SELECT last_claim_epoch FROM commitments WHERE commitment_id = ?1",
+            params![commitment_id.as_ref()],
+            |row| row.get::<_, Option<i64>>(0),
+        )
+        .map_err(StoreError::from)
+        .and_then(|value| {
+            value
+                .map(ClaimEpoch::try_from_raw)
+                .transpose()
+                .map_err(Into::into)
+        })
+}
+
+fn validate_claim_persistence(
+    transaction: &Transaction<'_>,
+    commitment: &Commitment,
+    current_state: &CommitmentState,
+    current_high_water: Option<ClaimEpoch>,
+) -> Result<(), StoreError> {
+    let current_claim = transaction
+        .query_row(
+            "SELECT worker_id, claim_epoch, last_heartbeat
+             FROM claims WHERE commitment_id = ?1",
+            params![commitment.commitment_id().as_ref()],
+            |row| {
+                Ok((
+                    parse_id(row.get(0)?, "worker", WorkerId::try_new),
+                    ClaimEpoch::try_from_raw(row.get(1)?),
+                    MonotonicInstant::try_from_raw(row.get(2)?),
+                ))
+            },
+        )
+        .optional()?
+        .map(|(worker, epoch, heartbeat)| Ok::<_, StoreError>((worker?, epoch?, heartbeat?)))
+        .transpose()?;
+
+    if commitment.state().requires_active_claim() != commitment.claim().is_some() {
+        return Err(StoreError::InvalidMutation(
+            "commitment state and candidate claim disagree".to_owned(),
+        ));
+    }
+
+    match (current_claim, commitment.claim()) {
+        (Some((worker, epoch, heartbeat)), Some(candidate)) => {
+            if worker != *candidate.worker_id()
+                || epoch != candidate.epoch()
+                || heartbeat != candidate.last_heartbeat()
+            {
+                return Err(StoreError::ClaimMismatch {
+                    commitment_id: commitment.commitment_id().to_string(),
+                    reason: "generic persistence cannot rewrite the current claim".to_owned(),
+                });
+            }
+            if current_high_water != Some(epoch)
+                || commitment.last_claim_epoch() != current_high_water
+            {
+                return Err(StoreError::InvalidPersistedData(
+                    "active claim epoch does not equal the durable high-water mark".to_owned(),
+                ));
+            }
+        }
+        (Some(_), None) => {
+            if commitment.state().requires_active_claim() {
+                return Err(StoreError::InvalidMutation(
+                    "claim-bearing state cannot persist without its current claim".to_owned(),
+                ));
+            }
+            if commitment.last_claim_epoch() != current_high_water {
+                return Err(StoreError::InvalidMutation(
+                    "generic persistence cannot rewrite the claim epoch high-water mark".to_owned(),
+                ));
+            }
+        }
+        (None, Some(candidate)) => {
+            if !matches!(current_state, CommitmentState::Ready)
+                || !matches!(commitment.state(), CommitmentState::Claimed)
+            {
+                return Err(StoreError::ClaimMismatch {
+                    commitment_id: commitment.commitment_id().to_string(),
+                    reason: "a new claim may only claim a READY commitment".to_owned(),
+                });
+            }
+            let expected_epoch = match current_high_water {
+                Some(epoch) => {
+                    let next = epoch
+                        .value()
+                        .checked_add(1)
+                        .ok_or(DomainError::EpochExhausted)?;
+                    ClaimEpoch::try_from_raw(i64::try_from(next).map_err(|_| {
+                        StoreError::InvalidMutation(
+                            "claim epoch does not fit in SQLite INTEGER".to_owned(),
+                        )
+                    })?)?
+                }
+                None => ClaimEpoch::initial(),
+            };
+            if candidate.epoch() != expected_epoch
+                || commitment.last_claim_epoch() != Some(expected_epoch)
+            {
+                return Err(DomainError::StaleEpoch {
+                    expected: expected_epoch,
+                    actual: candidate.epoch(),
+                }
+                .into());
+            }
+        }
+        (None, None) => {
+            if commitment.last_claim_epoch() != current_high_water {
+                return Err(StoreError::InvalidMutation(
+                    "generic persistence cannot rewrite the claim epoch high-water mark".to_owned(),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_commitment_event_state(
+    event: &WorkEvent,
+    state: &CommitmentState,
+) -> Result<(), StoreError> {
+    let matches = match event {
+        WorkEvent::CommitmentActivated { .. } => matches!(state, CommitmentState::Ready),
+        WorkEvent::CommitmentClaimed { .. } => matches!(state, CommitmentState::Claimed),
+        WorkEvent::CommitmentStarted { .. } => matches!(state, CommitmentState::Working),
+        WorkEvent::CommitmentWaiting { reason, .. } => {
+            matches!(state, CommitmentState::Waiting(candidate) if candidate == reason)
+        }
+        WorkEvent::CommitmentRecoveryPending { .. } => {
+            matches!(state, CommitmentState::RecoveryPending)
+        }
+        WorkEvent::CommitmentCompletionProposed { .. } => {
+            matches!(state, CommitmentState::CompletionProposed)
+        }
+        WorkEvent::CommitmentCompleted { .. } => matches!(state, CommitmentState::Completed),
+        WorkEvent::CommitmentCancelled { .. } => matches!(state, CommitmentState::Cancelled),
+        WorkEvent::CommitmentAbandoned { .. } => matches!(state, CommitmentState::Abandoned),
+        _ => false,
+    };
+    if matches {
+        Ok(())
+    } else {
+        Err(StoreError::InvalidMutation(
+            "commitment event does not describe the candidate state".to_owned(),
+        ))
+    }
 }
 
 fn apply_decomposition(

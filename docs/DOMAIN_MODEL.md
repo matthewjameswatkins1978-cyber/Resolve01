@@ -1,6 +1,6 @@
 # Domain model
 
-S1 implements the core domain model in `crates/resolve-core`. It contains
+R0 implements the core domain model in `crates/resolve-core`. It contains
 only the concepts frozen by Issue #1; it does not persist or execute them.
 
 ## Identifiers and value types
@@ -33,7 +33,7 @@ enum. Claimant mutations require both the current `WorkerId` and
 All commitment fields are private. Callers receive IDs and parent references,
 descriptions, prerequisite and acceptance slices, state, claim, and
 outstanding-action references through read-only accessors. The outstanding
-action is intentionally read-only; S4 changes it only through the controlled
+action is intentionally read-only; the store changes it only through the controlled
 guard/outcome lifecycle at the store boundary.
 `CommitmentState::requires_active_claim()` is the shared domain rule for claim
 ownership: `CLAIMED`, `WORKING`, ordinary `WAITING`, and
@@ -44,7 +44,7 @@ ownership: `CLAIMED`, `WORKING`, ordinary `WAITING`, and
 verification, and human decision. `WaitingReason` keeps prerequisite,
 authority, human-decision, verification, uncertain-action, and external
 waiting semantically distinct. `TethersOutcome` likewise has distinct
-`Succeeded`, `Failed`, and `Uncertain` variants. The S4 store boundary records
+`Succeeded`, `Failed`, and `Uncertain` variants. The store boundary records
 outcomes by their typed action reference; `Uncertain` remains fenced and is
 never collapsed into `Failed`.
 
@@ -66,7 +66,7 @@ issued, admitted, resolved, uncertain, and invalidated forms. `MonotonicDuration
 
 ## Structural proposals
 
-S5 adds the closed `StructuralProposal` enum in `resolve-core`. It contains
+The R0 structural boundary adds the closed `StructuralProposal` enum in `resolve-core`. It contains
 only `Decompose`, `AddPrerequisite`, and `Abandon`, each carrying a typed
 commitment target and claim epoch. `NewCommitment` is a validated child value;
 it exposes only its ID, description, typed prerequisites, and acceptance

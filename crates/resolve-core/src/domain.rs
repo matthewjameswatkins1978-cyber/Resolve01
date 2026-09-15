@@ -300,6 +300,16 @@ pub enum CommitmentState {
 }
 
 impl CommitmentState {
+    /// Validate a persistence candidate against this current state.
+    ///
+    /// The state-machine implementation remains private; this read-only
+    /// query is the narrow boundary needed by Resolve's persistence crate to
+    /// reject manually reconstructed aggregates that bypass Commitment's
+    /// mutating methods.
+    pub fn validate_transition_to(&self, next: &Self) -> Result<(), DomainError> {
+        validate_transition(self, next)
+    }
+
     pub fn is_terminal(&self) -> bool {
         matches!(self, Self::Completed | Self::Cancelled | Self::Abandoned)
     }

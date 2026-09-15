@@ -10,11 +10,16 @@ long-term memory system.
 
 ## Status
 
-The repository is currently at S5 (structural planning). The Rust workspace,
-S1 domain model, SQLite/WAL persistence boundary, fenced ExecutionGuard
-issuance/admission, recovery, outcome handling, and the closed R0 structural
-proposal boundary are implemented. Services, schedulers, and planning beyond
-the frozen structural mutations remain intentionally unimplemented.
+Resolve R0 proves the local fenced-commitment blackboard architecture under
+deterministic and adversarial tests. The Rust workspace, domain model,
+SQLite/WAL persistence boundary, fenced ExecutionGuard issuance/admission,
+recovery, outcome handling, and closed structural proposal boundary are
+implemented and verified. It is not production-ready.
+
+R0 remains intentionally limited to a single local SQLite authority, a
+simulated semantic Tethers boundary rather than production transport, and no
+UNCERTAIN reconciliation, service/API, scheduler, Lantern integration, or
+distributed consensus.
 
 ## Workspace
 

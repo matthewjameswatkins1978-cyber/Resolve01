@@ -1,6 +1,6 @@
 # Structural planning
 
-S5 implements the frozen R0 structural mutation boundary. It is a small,
+R0 implements the frozen structural mutation boundary. It is a small,
 claim-fenced mutation surface, not a planner or workflow engine.
 
 ## Pure proposal boundary
