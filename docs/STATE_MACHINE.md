@@ -58,6 +58,16 @@ composite ancestors in deterministic, bounded order; this is not a public
 generic `WAITING -> COMPLETED` transition. Unfinished composite barriers block
 `recover_without_action` rather than being released to `READY`.
 
+A structural proposal requires a currently live Claim derived from the
+persisted heartbeat and trusted lease duration, not merely matching worker,
+epoch, and boot-generation identity. Decomposition is stricter than the
+other proposal forms: only `WORKING` may enter the composite-barrier waiting
+state. Once `replacement_terminal_id` is set, the parent is no longer ordinary
+waiting work; generic resume and completion-proposal persistence cannot bypass
+the barrier. Explicit `CANCELLED` or `ABANDONED` terminalisation remains a
+valid exit where the existing state-machine rules permit it, and terminal
+immutability means later child completion never rewrites that terminal state.
+
 `UNCERTAIN` is represented as
 `WAITING(UncertainAction(action_ref))`, retains the outstanding action and held
 scope locks, and cannot be resumed through the ordinary `resume` API. A safe

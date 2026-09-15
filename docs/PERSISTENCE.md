@@ -107,14 +107,26 @@ lease expiry. Safe outcomes release held locks atomically; `UNCERTAIN`
 deliberately retains the action and locks.
 
 Structural proposals use their own immediate transaction. The store rechecks
-the exact current worker claim, epoch, boot generation, state version, and
-guard safety before applying one of the closed proposal forms. Decomposition
+the exact current worker claim, epoch, boot generation, state version, persisted
+heartbeat, live lease bound, and guard safety before applying one of the closed
+proposal forms. A structural mutation needs a currently live Claim, not merely
+matching persisted worker/epoch identity. Decomposition
 inserts proposed direct children, appends typed child/parent/audit events, and
 records the replacement-terminal link atomically. Add-prerequisite appends one
-normalized row without an automatic state change. Abandonment records the
-normal terminal mutation and rationale evidence. Completion of a replacement
-terminal is followed by a bounded event-reactive barrier cascade; no scheduler
-or background loop is involved.
+normalized row without an automatic state change and is rejected for an active
+composite barrier. Abandonment records the normal terminal mutation and
+rationale evidence. Completion of a replacement terminal is followed by a
+bounded event-reactive barrier cascade; no scheduler or background loop is
+involved.
+
+`replacement_terminal_id` turns a non-terminal parent into a special composite
+barrier. Generic persistence rejects ordinary resume or completion-proposal
+changes for that parent; heartbeat and lease-expiry paths remain dedicated
+exceptions. The cascade re-reads every queued child and requires persisted
+`COMPLETED` state. Explicit `CANCELLED` or `ABANDONED` terminalisation wins
+over later replacement-terminal completion, which becomes a no-op for that
+parent. Terminal commitments are never rewritten and downstream prerequisites
+remain unchanged.
 
 The domain restoration and startup paths use one additional invariant: when an
 active claim exists, its epoch must equal the commitment's durable

@@ -1,7 +1,7 @@
 use resolve_core::{
     BootGeneration, ClaimLease, Commitment, CommitmentId, CommitmentState, GoalId, GoalRevision,
-    GoalSpec, GoalState, MonotonicInstant, NewCommitment, Prerequisite, StructuralProposal,
-    TethersContractRef, Timestamp, WaitingReason, WorkEvent, WorkerId,
+    GoalSpec, GoalState, MonotonicDuration, MonotonicInstant, NewCommitment, Prerequisite,
+    StructuralProposal, TethersContractRef, Timestamp, WaitingReason, WorkEvent, WorkerId,
 };
 use resolve_store::{SqliteStore, StoreError};
 
@@ -65,7 +65,11 @@ fn add_commitment(
     commitment
 }
 
-fn make_working(store: &mut SqliteStore, mut commitment: Commitment) -> (Commitment, ClaimLease) {
+fn make_working(
+    store: &mut SqliteStore,
+    mut commitment: Commitment,
+    heartbeat: u64,
+) -> (Commitment, ClaimLease) {
     commitment.activate().expect("activation");
     store
         .persist_commitment_change(
@@ -78,7 +82,7 @@ fn make_working(store: &mut SqliteStore, mut commitment: Commitment) -> (Commitm
         )
         .expect("activation persists");
     let claim = commitment
-        .claim_for(worker_id(), MonotonicInstant::from_ticks(1))
+        .claim_for(worker_id(), MonotonicInstant::from_ticks(heartbeat))
         .expect("claim");
     store
         .persist_commitment_change(
@@ -108,12 +112,479 @@ fn make_working(store: &mut SqliteStore, mut commitment: Commitment) -> (Commitm
     (commitment, claim)
 }
 
-fn store_with_working_target() -> (SqliteStore, Commitment, ClaimLease) {
+fn store_with_working_target_at(heartbeat: u64) -> (SqliteStore, Commitment, ClaimLease) {
     let mut store = SqliteStore::open_in_memory_for_tests().expect("store opens");
     prepare_goal(&mut store);
     let target = add_commitment(&mut store, "target", None, Vec::new());
-    let (target, claim) = make_working(&mut store, target);
+    let (target, claim) = make_working(&mut store, target, heartbeat);
     (store, target, claim)
+}
+
+fn store_with_working_target() -> (SqliteStore, Commitment, ClaimLease) {
+    store_with_working_target_at(1)
+}
+
+fn store_with_claimed_target() -> (SqliteStore, Commitment, ClaimLease) {
+    let mut store = SqliteStore::open_in_memory_for_tests().expect("store opens");
+    prepare_goal(&mut store);
+    let mut target = add_commitment(&mut store, "target", None, Vec::new());
+    target.activate().expect("activation");
+    store
+        .persist_commitment_change(
+            &target,
+            1,
+            &WorkEvent::CommitmentActivated {
+                commitment_id: target.commitment_id().clone(),
+            },
+            2,
+        )
+        .expect("activation persists");
+    let claim = target
+        .claim_for(worker_id(), MonotonicInstant::from_ticks(10))
+        .expect("claim");
+    store
+        .persist_commitment_change(
+            &target,
+            2,
+            &WorkEvent::CommitmentClaimed {
+                commitment_id: target.commitment_id().clone(),
+                worker_id: worker_id(),
+                epoch: claim.epoch(),
+            },
+            3,
+        )
+        .expect("claim persists");
+    (store, target, claim)
+}
+
+fn decompose_proposal(target: &Commitment, claim: &ClaimLease) -> StructuralProposal {
+    StructuralProposal::Decompose {
+        target: target.commitment_id().clone(),
+        epoch: claim.epoch(),
+        children: vec![
+            NewCommitment::new(commitment_id("child"), "child", Vec::new(), Vec::new())
+                .expect("child"),
+        ],
+        replacement_terminal_id: commitment_id("child"),
+    }
+}
+
+fn decompose_one_child(store: &mut SqliteStore, target: &Commitment, claim: &ClaimLease) {
+    let child =
+        NewCommitment::new(commitment_id("child"), "child", Vec::new(), Vec::new()).expect("child");
+    store
+        .apply_structural_proposal(
+            StructuralProposal::Decompose {
+                target: target.commitment_id().clone(),
+                epoch: claim.epoch(),
+                children: vec![child],
+                replacement_terminal_id: commitment_id("child"),
+            },
+            claim.worker_id(),
+            BootGeneration::from_raw(0),
+            MonotonicInstant::from_ticks(10),
+            MonotonicDuration::try_from_ticks(99).expect("duration"),
+            10,
+        )
+        .expect("decomposition applies");
+}
+
+fn complete_child(store: &mut SqliteStore, id: &str) {
+    let mut child = store
+        .load_commitment(&commitment_id(id))
+        .expect("child restores");
+    child.activate().expect("child activates");
+    store
+        .persist_commitment_change(
+            &child,
+            1,
+            &WorkEvent::CommitmentActivated {
+                commitment_id: commitment_id(id),
+            },
+            11,
+        )
+        .expect("child activation persists");
+    let child_claim = child
+        .claim_for(worker_id(), MonotonicInstant::from_ticks(11))
+        .expect("child claims");
+    store
+        .persist_commitment_change(
+            &child,
+            2,
+            &WorkEvent::CommitmentClaimed {
+                commitment_id: commitment_id(id),
+                worker_id: worker_id(),
+                epoch: child_claim.epoch(),
+            },
+            12,
+        )
+        .expect("child claim persists");
+    child
+        .start(child_claim.worker_id(), child_claim.epoch())
+        .expect("child starts");
+    store
+        .persist_commitment_change(
+            &child,
+            3,
+            &WorkEvent::CommitmentStarted {
+                commitment_id: commitment_id(id),
+            },
+            13,
+        )
+        .expect("child start persists");
+    child
+        .propose_completion(child_claim.worker_id(), child_claim.epoch())
+        .expect("child proposes completion");
+    store
+        .persist_commitment_change(
+            &child,
+            4,
+            &WorkEvent::CommitmentCompletionProposed {
+                commitment_id: commitment_id(id),
+            },
+            14,
+        )
+        .expect("completion proposal persists");
+    child
+        .complete(child_claim.worker_id(), child_claim.epoch())
+        .expect("child completes");
+    store
+        .persist_commitment_change(
+            &child,
+            5,
+            &WorkEvent::CommitmentCompleted {
+                commitment_id: commitment_id(id),
+            },
+            15,
+        )
+        .expect("child completion persists");
+}
+
+#[test]
+fn expired_claim_cannot_add_prerequisite_and_live_claim_can() {
+    let (mut store, target, claim) = store_with_working_target_at(10);
+    add_commitment(&mut store, "dependency", None, Vec::new());
+    let before_events = store.list_events().expect("events load").len();
+    let proposal = StructuralProposal::AddPrerequisite {
+        target: target.commitment_id().clone(),
+        prerequisite: Prerequisite::Commitment(commitment_id("dependency")),
+        epoch: claim.epoch(),
+    };
+    let error = store
+        .apply_structural_proposal(
+            proposal.clone(),
+            claim.worker_id(),
+            BootGeneration::from_raw(0),
+            MonotonicInstant::from_ticks(20),
+            MonotonicDuration::try_from_ticks(10).expect("duration"),
+            20,
+        )
+        .expect_err("expired claim cannot structurally mutate");
+    assert!(matches!(error, StoreError::LeaseExpired { .. }));
+    assert_eq!(
+        store.list_events().expect("events load").len(),
+        before_events
+    );
+    assert!(
+        store
+            .load_commitment_record(target.commitment_id())
+            .expect("target loads")
+            .prerequisites()
+            .is_empty()
+    );
+
+    store
+        .apply_structural_proposal(
+            proposal,
+            claim.worker_id(),
+            BootGeneration::from_raw(0),
+            MonotonicInstant::from_ticks(19),
+            MonotonicDuration::try_from_ticks(10).expect("duration"),
+            21,
+        )
+        .expect("live claim can structurally mutate");
+    assert_eq!(
+        store
+            .load_commitment_record(target.commitment_id())
+            .expect("target reloads")
+            .prerequisites(),
+        &[Prerequisite::Commitment(commitment_id("dependency"))]
+    );
+}
+
+#[test]
+fn expired_claim_cannot_decompose_and_live_claim_can() {
+    let (mut store, target, claim) = store_with_working_target_at(10);
+    let child =
+        NewCommitment::new(commitment_id("child"), "child", Vec::new(), Vec::new()).expect("child");
+    let proposal = StructuralProposal::Decompose {
+        target: target.commitment_id().clone(),
+        epoch: claim.epoch(),
+        children: vec![child],
+        replacement_terminal_id: commitment_id("child"),
+    };
+    let before_events = store.list_events().expect("events load").len();
+    let error = store
+        .apply_structural_proposal(
+            proposal.clone(),
+            claim.worker_id(),
+            BootGeneration::from_raw(0),
+            MonotonicInstant::from_ticks(20),
+            MonotonicDuration::try_from_ticks(10).expect("duration"),
+            20,
+        )
+        .expect_err("expired claim cannot decompose");
+    assert!(matches!(error, StoreError::LeaseExpired { .. }));
+    assert_eq!(
+        store.list_events().expect("events load").len(),
+        before_events
+    );
+    assert!(matches!(
+        store.load_commitment_record(&commitment_id("child")),
+        Err(StoreError::NotFound { .. })
+    ));
+    store
+        .apply_structural_proposal(
+            proposal,
+            claim.worker_id(),
+            BootGeneration::from_raw(0),
+            MonotonicInstant::from_ticks(19),
+            MonotonicDuration::try_from_ticks(10).expect("duration"),
+            21,
+        )
+        .expect("live claim can decompose");
+}
+
+#[test]
+fn decomposition_is_working_only() {
+    let cases = ["claimed", "waiting", "completion-proposed"];
+    for case in cases {
+        let (mut store, mut target, claim) = if case == "claimed" {
+            store_with_claimed_target()
+        } else {
+            store_with_working_target()
+        };
+        if case == "waiting" {
+            target
+                .wait(
+                    claim.worker_id(),
+                    claim.epoch(),
+                    WaitingReason::External("pause".to_owned()),
+                )
+                .expect("wait");
+            store
+                .persist_commitment_change(
+                    &target,
+                    4,
+                    &WorkEvent::CommitmentWaiting {
+                        commitment_id: target.commitment_id().clone(),
+                        reason: WaitingReason::External("pause".to_owned()),
+                    },
+                    5,
+                )
+                .expect("waiting persists");
+        } else if case == "completion-proposed" {
+            target
+                .propose_completion(claim.worker_id(), claim.epoch())
+                .expect("completion proposal");
+            store
+                .persist_commitment_change(
+                    &target,
+                    4,
+                    &WorkEvent::CommitmentCompletionProposed {
+                        commitment_id: target.commitment_id().clone(),
+                    },
+                    5,
+                )
+                .expect("completion proposal persists");
+        }
+        let before_events = store.list_events().expect("events load").len();
+        let error = store
+            .apply_structural_proposal(
+                decompose_proposal(&target, &claim),
+                claim.worker_id(),
+                BootGeneration::from_raw(0),
+                MonotonicInstant::from_ticks(10),
+                MonotonicDuration::try_from_ticks(99).expect("duration"),
+                10,
+            )
+            .expect_err("decomposition must require WORKING");
+        assert!(matches!(
+            error,
+            StoreError::Domain(resolve_core::DomainError::InvalidStructuralProposal { .. })
+        ));
+        assert_eq!(
+            store.list_events().expect("events load").len(),
+            before_events
+        );
+        assert!(matches!(
+            store.load_commitment_record(&commitment_id("child")),
+            Err(StoreError::NotFound { .. })
+        ));
+    }
+}
+
+#[test]
+fn active_composite_barrier_rejects_resume_completion_and_new_prerequisite() {
+    let (mut store, target, claim) = store_with_working_target();
+    decompose_one_child(&mut store, &target, &claim);
+    let before_events = store.list_events().expect("events load").len();
+
+    let mut resumed = store
+        .load_commitment(target.commitment_id())
+        .expect("parent restores");
+    resumed
+        .resume(
+            claim.worker_id(),
+            claim.epoch(),
+            resolve_core::ResumeTarget::Working,
+        )
+        .expect("domain resume remains representable");
+    let error = store
+        .persist_commitment_change(
+            &resumed,
+            5,
+            &WorkEvent::CommitmentStarted {
+                commitment_id: target.commitment_id().clone(),
+            },
+            11,
+        )
+        .expect_err("ordinary resume cannot bypass composite barrier");
+    assert!(matches!(
+        error,
+        StoreError::Domain(resolve_core::DomainError::InvalidStructuralProposal { .. })
+    ));
+    assert_eq!(
+        store.list_events().expect("events load").len(),
+        before_events
+    );
+
+    let mut proposed = store
+        .load_commitment(target.commitment_id())
+        .expect("parent restores");
+    proposed
+        .resume(
+            claim.worker_id(),
+            claim.epoch(),
+            resolve_core::ResumeTarget::Working,
+        )
+        .expect("resume");
+    proposed
+        .propose_completion(claim.worker_id(), claim.epoch())
+        .expect("completion proposal remains representable");
+    let error = store
+        .persist_commitment_change(
+            &proposed,
+            5,
+            &WorkEvent::CommitmentCompletionProposed {
+                commitment_id: target.commitment_id().clone(),
+            },
+            12,
+        )
+        .expect_err("completion proposal cannot bypass composite barrier");
+    assert!(matches!(
+        error,
+        StoreError::Domain(resolve_core::DomainError::InvalidStructuralProposal { .. })
+    ));
+
+    let error = store
+        .apply_structural_proposal(
+            StructuralProposal::AddPrerequisite {
+                target: target.commitment_id().clone(),
+                prerequisite: Prerequisite::TethersVerification(
+                    TethersContractRef::try_new("contract-1").expect("contract"),
+                ),
+                epoch: claim.epoch(),
+            },
+            claim.worker_id(),
+            BootGeneration::from_raw(0),
+            MonotonicInstant::from_ticks(10),
+            MonotonicDuration::try_from_ticks(99).expect("duration"),
+            13,
+        )
+        .expect_err("active composite barrier rejects added prerequisites");
+    assert!(matches!(
+        error,
+        StoreError::Domain(resolve_core::DomainError::InvalidStructuralProposal { .. })
+    ));
+    assert_eq!(
+        store.list_events().expect("events load").len(),
+        before_events
+    );
+    assert_eq!(
+        store
+            .load_commitment_record(target.commitment_id())
+            .expect("parent reloads")
+            .state(),
+        &CommitmentState::Waiting(WaitingReason::Prerequisite(commitment_id("child")))
+    );
+}
+
+#[test]
+fn abandoned_and_cancelled_composite_parents_survive_child_completion() {
+    let (mut store, target, claim) = store_with_working_target();
+    decompose_one_child(&mut store, &target, &claim);
+    store
+        .apply_structural_proposal(
+            StructuralProposal::Abandon {
+                target: target.commitment_id().clone(),
+                epoch: claim.epoch(),
+                rationale: "authority withdrew the composite work".to_owned(),
+            },
+            claim.worker_id(),
+            BootGeneration::from_raw(0),
+            MonotonicInstant::from_ticks(10),
+            MonotonicDuration::try_from_ticks(99).expect("duration"),
+            11,
+        )
+        .expect("abandon applies");
+    assert_eq!(
+        store
+            .load_commitment_record(target.commitment_id())
+            .expect("parent loads")
+            .state(),
+        &CommitmentState::Abandoned
+    );
+    assert!(
+        store
+            .load_commitment_record(target.commitment_id())
+            .expect("parent loads")
+            .replacement_terminal_id()
+            .is_some()
+    );
+    complete_child(&mut store, "child");
+    assert_eq!(
+        store
+            .load_commitment_record(target.commitment_id())
+            .expect("abandoned parent remains")
+            .state(),
+        &CommitmentState::Abandoned
+    );
+
+    let (mut store, target, claim) = store_with_working_target();
+    decompose_one_child(&mut store, &target, &claim);
+    let mut parent = store
+        .load_commitment(target.commitment_id())
+        .expect("parent restores");
+    parent.cancel().expect("explicit cancellation");
+    store
+        .persist_commitment_change(
+            &parent,
+            5,
+            &WorkEvent::CommitmentCancelled {
+                commitment_id: target.commitment_id().clone(),
+            },
+            11,
+        )
+        .expect("cancellation persists");
+    complete_child(&mut store, "child");
+    assert_eq!(
+        store
+            .load_commitment_record(target.commitment_id())
+            .expect("cancelled parent remains")
+            .state(),
+        &CommitmentState::Cancelled
+    );
 }
 
 #[test]
@@ -145,6 +616,7 @@ fn decomposition_is_typed_direct_same_goal_and_barrier_completes_parent() {
             claim.worker_id(),
             BootGeneration::from_raw(0),
             MonotonicInstant::from_ticks(10),
+            MonotonicDuration::try_from_ticks(99).expect("duration"),
             10,
         )
         .expect("decomposition applies");
@@ -267,7 +739,7 @@ fn decomposition_is_typed_direct_same_goal_and_barrier_completes_parent() {
 fn add_prerequisite_is_atomic_typed_and_cycle_checked() {
     let (mut store, target, claim) = store_with_working_target();
     let dependency = add_commitment(&mut store, "dependency", None, Vec::new());
-    let (_dependency, dependency_claim) = make_working(&mut store, dependency);
+    let (_dependency, dependency_claim) = make_working(&mut store, dependency, 1);
     store
         .apply_structural_proposal(
             StructuralProposal::AddPrerequisite {
@@ -278,6 +750,7 @@ fn add_prerequisite_is_atomic_typed_and_cycle_checked() {
             claim.worker_id(),
             BootGeneration::from_raw(0),
             MonotonicInstant::from_ticks(10),
+            MonotonicDuration::try_from_ticks(99).expect("duration"),
             10,
         )
         .expect("prerequisite applies");
@@ -301,6 +774,7 @@ fn add_prerequisite_is_atomic_typed_and_cycle_checked() {
             dependency_claim.worker_id(),
             BootGeneration::from_raw(0),
             MonotonicInstant::from_ticks(11),
+            MonotonicDuration::try_from_ticks(99).expect("duration"),
             11,
         )
         .expect_err("cycle must fail");
@@ -330,6 +804,7 @@ fn abandon_requires_rationale_and_clears_claim_without_touching_downstream() {
             claim.worker_id(),
             BootGeneration::from_raw(0),
             MonotonicInstant::from_ticks(10),
+            MonotonicDuration::try_from_ticks(99).expect("duration"),
             10,
         )
         .expect("abandon applies");
@@ -363,6 +838,7 @@ fn composite_recovery_blocks_until_replacement_terminal_completes() {
             claim.worker_id(),
             BootGeneration::from_raw(0),
             MonotonicInstant::from_ticks(10),
+            MonotonicDuration::try_from_ticks(99).expect("duration"),
             10,
         )
         .expect("decomposition applies");

@@ -525,20 +525,38 @@ impl SqliteStore {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let boot_generation = current_boot_generation(&transaction)?;
-        let (current_version, current_outstanding_action): (i64, Option<String>) = transaction
+        let (
+            current_version,
+            current_state_json,
+            current_replacement_terminal_id,
+            current_outstanding_action,
+        ): (i64, String, Option<String>, Option<String>) = transaction
             .query_row(
-                "SELECT state_version, outstanding_action
+                "SELECT state_version, state_json, replacement_terminal_id, outstanding_action
                  FROM commitments WHERE commitment_id = ?1",
                 params![commitment.commitment_id().as_ref()],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
             .optional()?
             .ok_or_else(|| not_found("commitment", commitment.commitment_id().to_string()))?;
+        let current_state = decode_commitment_state(&current_state_json)?;
         if let Some(action_ref) = current_outstanding_action {
             return Err(StoreError::OutstandingAction {
                 commitment_id: commitment.commitment_id().to_string(),
                 action_ref,
             });
+        }
+        if current_replacement_terminal_id.is_some()
+            && !current_state.is_terminal()
+            && !matches!(
+                commitment.state(),
+                CommitmentState::Cancelled | CommitmentState::Abandoned
+            )
+        {
+            return Err(DomainError::InvalidStructuralProposal {
+                reason: "ordinary persistence cannot bypass an active composite barrier",
+            }
+            .into());
         }
         ensure_version(
             "commitment",
@@ -588,6 +606,7 @@ impl SqliteStore {
         worker_id: &WorkerId,
         boot_generation: BootGeneration,
         now: MonotonicInstant,
+        claim_lease_duration: MonotonicDuration,
         created_at: i64,
     ) -> Result<i64, StoreError> {
         validate_proposal_shape(&proposal)?;
@@ -629,6 +648,22 @@ impl SqliteStore {
                 reason: format!("structural mutation is not valid in {state:?}"),
             });
         }
+        if matches!(&proposal, StructuralProposal::Decompose { .. })
+            && !matches!(state, CommitmentState::Working)
+        {
+            return Err(DomainError::InvalidStructuralProposal {
+                reason: "decomposition requires a WORKING commitment",
+            }
+            .into());
+        }
+        if !matches!(&proposal, StructuralProposal::Abandon { .. })
+            && context.replacement_terminal_id.is_some()
+        {
+            return Err(DomainError::InvalidStructuralProposal {
+                reason: "an active composite barrier accepts only explicit abandonment",
+            }
+            .into());
+        }
         if let Some(action_ref) = context.outstanding_action {
             return Err(StoreError::OutstandingAction {
                 commitment_id: target.to_string(),
@@ -655,6 +690,19 @@ impl SqliteStore {
             return Err(StoreError::ClaimMismatch {
                 commitment_id: target.to_string(),
                 reason: "proposal worker or claim boot generation does not match".to_owned(),
+            });
+        }
+        let heartbeat_ticks = context
+            .last_heartbeat
+            .ok_or_else(|| StoreError::ClaimMismatch {
+                commitment_id: target.to_string(),
+                reason: "commitment has no persisted claim heartbeat".to_owned(),
+            })?;
+        let heartbeat = MonotonicInstant::try_from_raw(heartbeat_ticks)?;
+        let claim_deadline = claim_lease_duration.deadline_from(heartbeat)?;
+        if claim_deadline <= now {
+            return Err(StoreError::LeaseExpired {
+                commitment_id: target.to_string(),
             });
         }
         expire_target_reservations(&transaction, target, now_ticks)?;
@@ -2807,6 +2855,7 @@ struct StructuralTargetContext {
     last_claim_epoch: Option<i64>,
     worker_id: Option<String>,
     claim_epoch: Option<i64>,
+    last_heartbeat: Option<i64>,
     claim_boot_generation: Option<i64>,
     replacement_terminal_id: Option<String>,
 }
@@ -2825,7 +2874,7 @@ fn query_structural_target(
         .query_row(
             "SELECT c.goal_id, c.state_json, c.outstanding_action, c.state_version,
                     c.last_claim_epoch, c.replacement_terminal_id,
-                    cl.worker_id, cl.claim_epoch, cl.boot_generation
+                    cl.worker_id, cl.claim_epoch, cl.last_heartbeat, cl.boot_generation
              FROM commitments c
              LEFT JOIN claims cl ON cl.commitment_id = c.commitment_id
              WHERE c.commitment_id = ?1",
@@ -2841,7 +2890,8 @@ fn query_structural_target(
                     replacement_terminal_id: row.get(5)?,
                     worker_id: row.get(6)?,
                     claim_epoch: row.get(7)?,
-                    claim_boot_generation: row.get(8)?,
+                    last_heartbeat: row.get(8)?,
+                    claim_boot_generation: row.get(9)?,
                 })
             },
         )
@@ -3201,6 +3251,26 @@ fn complete_composite_barrier_cascade(
     let mut pending = vec![completed_id.clone()];
     let mut processed = 0_i64;
     while let Some(child_id) = pending.pop() {
+        let child_state_json: String = transaction
+            .query_row(
+                "SELECT state_json FROM commitments WHERE commitment_id = ?1",
+                params![child_id.as_ref()],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or_else(|| {
+                StoreError::InvalidPersistedData(
+                    "composite barrier cascade child is missing".to_owned(),
+                )
+            })?;
+        if !matches!(
+            decode_commitment_state(&child_state_json)?,
+            CommitmentState::Completed
+        ) {
+            return Err(StoreError::InvalidPersistedData(
+                "composite barrier cascade child is not completed".to_owned(),
+            ));
+        }
         let mut statement = transaction.prepare(
             "SELECT commitment_id, goal_id, state_json, state_version,
                     outstanding_action
@@ -3245,13 +3315,16 @@ fn complete_composite_barrier_cascade(
                     "composite barrier child is not a direct same-goal child".to_owned(),
                 ));
             }
+            let state = decode_commitment_state(&state_json)?;
+            if state.is_terminal() {
+                continue;
+            }
             if outstanding_action.is_some() {
                 return Err(StoreError::RecoveryBlocked {
                     commitment_id: parent_id.to_string(),
                     reason: "composite barrier parent has an outstanding action".to_owned(),
                 });
             }
-            let state = decode_commitment_state(&state_json)?;
             let is_waiting_on_child = matches!(
                 &state,
                 CommitmentState::Waiting(WaitingReason::Prerequisite(prerequisite))
@@ -4126,5 +4199,61 @@ fn event_commitment_id(event: &WorkEvent) -> Option<&CommitmentId> {
         | WorkEvent::TethersOutcomeRecorded { .. }
         | WorkEvent::AttentionCleared { .. } => None,
         WorkEvent::StructuralProposalApplied { target, .. } => Some(target),
+    }
+}
+
+#[cfg(test)]
+mod structural_barrier_tests {
+    use super::*;
+
+    #[test]
+    fn barrier_cascade_rejects_a_non_completed_queue_item() {
+        let mut store = SqliteStore::open_in_memory_for_tests().expect("store opens");
+        let goal_id = GoalId::try_new("goal-test").expect("goal");
+        let goal = GoalSpec::new(
+            goal_id.clone(),
+            resolve_core::GoalRevision::initial(),
+            "barrier test",
+            GoalState::Active,
+            resolve_core::Timestamp::from_unix_seconds(0),
+        )
+        .expect("goal value");
+        store
+            .insert_goal(
+                &goal,
+                &WorkEvent::GoalCreated {
+                    goal_id: goal_id.clone(),
+                    revision: resolve_core::GoalRevision::initial(),
+                },
+            )
+            .expect("goal persists");
+        let child_id = CommitmentId::try_new("child-test").expect("child");
+        let child = Commitment::new(
+            child_id.clone(),
+            goal_id.clone(),
+            None,
+            "child",
+            Vec::new(),
+            Vec::new(),
+        )
+        .expect("child value");
+        store
+            .insert_commitment(
+                &child,
+                &WorkEvent::CommitmentCreated {
+                    commitment_id: child_id.clone(),
+                    goal_id,
+                },
+                1,
+            )
+            .expect("child persists");
+        let transaction = store
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .expect("transaction opens");
+        let error = complete_composite_barrier_cascade(&transaction, &child_id, 2)
+            .expect_err("non-completed child cannot satisfy a barrier");
+        assert!(matches!(error, StoreError::InvalidPersistedData(_)));
+        transaction.rollback().expect("rollback succeeds");
     }
 }
