@@ -3,8 +3,8 @@ RESOLVE R0 IMPLEMENTATION REPORT
 Repository: matthewjameswatkins1978-cyber/Resolve01
 Branch: codex/resolve-r0-s6-adversarial-closure
 Starting SHA: 8d9e7ce2c7d6fd6953f4a201d31ea4f6b0f4cd54
-Ending SHA: pending final S6 commit
-Merged main SHA: pending normal PR merge
+Ending SHA: 12efb99d095f8d437d81db7c32a0de2dc20e5a9e
+Merged main SHA: ddfd3d0c890c10130447c7b4b01f1718b6b580e1
 
 Implemented:
 S6 adversarial closure over the frozen R0 domain, SQLite/WAL persistence,
@@ -77,16 +77,16 @@ git diff --check:
 PASS
 
 Push:
-pending
+PASS — codex/resolve-r0-s6-adversarial-closure pushed at 12efb99d095f8d437d81db7c32a0de2dc20e5a9e.
 
 PR:
-pending
+PASS — PR #16 opened against main with exact starting base and complete intended diff.
 
 Merge:
-pending
+PASS — PR #16 merged normally as ddfd3d0c890c10130447c7b4b01f1718b6b580e1.
 
 Post-merge CI:
-pending
+PASS — CI run 34997954409 passed on ddfd3d0c890c10130447c7b4b01f1718b6b580e1.
 
 Known limitations:
 single local SQLite authority; simulated semantic Tethers boundary rather
