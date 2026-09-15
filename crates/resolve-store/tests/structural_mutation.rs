@@ -169,16 +169,21 @@ fn decompose_proposal(target: &Commitment, claim: &ClaimLease) -> StructuralProp
     }
 }
 
-fn decompose_one_child(store: &mut SqliteStore, target: &Commitment, claim: &ClaimLease) {
-    let child =
-        NewCommitment::new(commitment_id("child"), "child", Vec::new(), Vec::new()).expect("child");
+fn decompose_named_child(
+    store: &mut SqliteStore,
+    target: &Commitment,
+    claim: &ClaimLease,
+    child_id: &str,
+) {
+    let child = NewCommitment::new(commitment_id(child_id), child_id, Vec::new(), Vec::new())
+        .expect("child");
     store
         .apply_structural_proposal(
             StructuralProposal::Decompose {
                 target: target.commitment_id().clone(),
                 epoch: claim.epoch(),
                 children: vec![child],
-                replacement_terminal_id: commitment_id("child"),
+                replacement_terminal_id: commitment_id(child_id),
             },
             claim.worker_id(),
             BootGeneration::from_raw(0),
@@ -187,6 +192,10 @@ fn decompose_one_child(store: &mut SqliteStore, target: &Commitment, claim: &Cla
             10,
         )
         .expect("decomposition applies");
+}
+
+fn decompose_one_child(store: &mut SqliteStore, target: &Commitment, claim: &ClaimLease) {
+    decompose_named_child(store, target, claim, "child");
 }
 
 fn complete_child(store: &mut SqliteStore, id: &str) {
@@ -584,6 +593,34 @@ fn abandoned_and_cancelled_composite_parents_survive_child_completion() {
             .expect("cancelled parent remains")
             .state(),
         &CommitmentState::Cancelled
+    );
+}
+
+#[test]
+fn nested_composite_barriers_complete_in_bounded_child_order() {
+    let (mut store, root, root_claim) = store_with_working_target();
+    decompose_named_child(&mut store, &root, &root_claim, "middle");
+    let middle = store
+        .load_commitment(&commitment_id("middle"))
+        .expect("middle restores");
+    let (middle, middle_claim) = make_working(&mut store, middle, 30);
+    decompose_named_child(&mut store, &middle, &middle_claim, "leaf");
+
+    complete_child(&mut store, "leaf");
+
+    assert_eq!(
+        store
+            .load_commitment_record(&commitment_id("middle"))
+            .expect("middle reloads")
+            .state(),
+        &CommitmentState::Completed
+    );
+    assert_eq!(
+        store
+            .load_commitment_record(root.commitment_id())
+            .expect("root reloads")
+            .state(),
+        &CommitmentState::Completed
     );
 }
 
