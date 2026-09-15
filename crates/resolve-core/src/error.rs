@@ -40,6 +40,7 @@ pub enum DomainError {
     InvalidNumericValue {
         kind: &'static str,
     },
+    EmptyScopeSet,
 }
 
 impl fmt::Display for DomainError {
@@ -84,12 +85,13 @@ impl fmt::Display for DomainError {
             Self::RevisionExhausted => formatter.write_str("goal revision space is exhausted"),
             Self::InvalidDuration => formatter.write_str("duration must be greater than zero"),
             Self::InvalidLeaseDeadline => {
-                formatter.write_str("lease deadline must not precede the current instant")
+                formatter.write_str("lease deadline must be after the current instant")
             }
             Self::TimeOverflow => formatter.write_str("monotonic time arithmetic overflowed"),
             Self::InvalidNumericValue { kind } => {
                 write!(formatter, "{kind} value is outside its valid range")
             }
+            Self::EmptyScopeSet => formatter.write_str("a guard scope set must not be empty"),
         }
     }
 }

@@ -1,7 +1,7 @@
 use resolve_core::{
     BootGeneration, ClaimEpoch, Commitment, CommitmentId, ExecutionGuard, GoalId, GoalRevision,
     GoalSpec, GoalState, GuardId, GuardState, MonotonicDuration, MonotonicInstant, ScopeKey,
-    TethersActionRef, Timestamp, WorkEvent, WorkerId,
+    ScopeSet, TethersActionRef, Timestamp, WorkEvent, WorkerId,
 };
 use resolve_store::{GuardAdmission, GuardIssueRequest, SqliteStore, StoreError};
 use rusqlite::Connection;
@@ -29,6 +29,10 @@ fn scope(value: &str) -> ScopeKey {
 
 fn action(value: &str) -> TethersActionRef {
     TethersActionRef::try_new(value).expect("test action is valid")
+}
+
+fn scope_set(values: Vec<ScopeKey>) -> ScopeSet {
+    ScopeSet::try_new(values).expect("test scope set is valid")
 }
 
 fn add_claimed_commitment(
@@ -86,8 +90,7 @@ fn add_claimed_commitment(
     claim.epoch()
 }
 
-fn claimed_store() -> SqliteStore {
-    let mut store = SqliteStore::open_in_memory_for_tests().expect("store opens");
+fn prepare_claimed_store(store: &mut SqliteStore) {
     let goal = GoalSpec::new(
         goal_id(),
         GoalRevision::initial(),
@@ -108,14 +111,19 @@ fn claimed_store() -> SqliteStore {
     store
         .set_boot_generation(BootGeneration::from_raw(7))
         .expect("boot generation sets");
-    add_claimed_commitment(&mut store, "commitment-1", "worker-1", 1);
+    add_claimed_commitment(store, "commitment-1", "worker-1", 1);
+}
+
+fn claimed_store() -> SqliteStore {
+    let mut store = SqliteStore::open_in_memory_for_tests().expect("store opens");
+    prepare_claimed_store(&mut store);
     store
 }
 
 struct Timing {
     now: u64,
     ttl: u64,
-    claim_deadline: u64,
+    claim_lease_duration: u64,
 }
 
 fn issue(
@@ -132,12 +140,181 @@ fn issue(
         commitment_id: commitment_id(commitment),
         worker_id: worker_id(worker),
         claim_epoch: epoch,
-        scope_keys: scopes,
+        scope_keys: scope_set(scopes),
         boot_generation: BootGeneration::from_raw(7),
         now: MonotonicInstant::from_ticks(timing.now),
         guard_ttl: MonotonicDuration::try_from_ticks(timing.ttl).expect("test duration is valid"),
-        claim_lease_deadline: MonotonicInstant::from_ticks(timing.claim_deadline),
+        claim_lease_duration: MonotonicDuration::try_from_ticks(timing.claim_lease_duration)
+            .expect("test claim duration is valid"),
     })
+}
+
+#[test]
+fn empty_scope_set_is_rejected_without_store_mutation() {
+    let store = claimed_store();
+    let event_count = store.list_events().expect("events load").len();
+
+    let error = ScopeSet::try_new(Vec::new()).expect_err("empty scope set must be rejected");
+    assert_eq!(error, resolve_core::DomainError::EmptyScopeSet);
+    assert_eq!(store.list_events().expect("events load").len(), event_count);
+    assert!(matches!(
+        store.load_guard_record(&guard_id("guard-empty")),
+        Err(StoreError::NotFound {
+            entity: "guard",
+            ..
+        })
+    ));
+}
+
+#[test]
+fn persisted_heartbeat_and_trusted_duration_bound_reservation() {
+    let mut store = claimed_store();
+    let guard = issue(
+        &mut store,
+        "guard-lease-bound",
+        "commitment-1",
+        ClaimEpoch::initial(),
+        "worker-1",
+        vec![scope("lease-bound")],
+        Timing {
+            now: 10,
+            ttl: 100,
+            claim_lease_duration: 20,
+        },
+    )
+    .expect("guard issues");
+
+    assert_eq!(
+        guard.reservation_expires_at(),
+        MonotonicInstant::from_ticks(21),
+        "stored heartbeat 1 plus trusted duration 20 is the claim bound"
+    );
+}
+
+#[test]
+fn expired_persisted_claim_cannot_issue_or_append() {
+    let mut store = claimed_store();
+    let event_count = store.list_events().expect("events load").len();
+
+    let error = issue(
+        &mut store,
+        "guard-expired-claim",
+        "commitment-1",
+        ClaimEpoch::initial(),
+        "worker-1",
+        vec![scope("expired-claim")],
+        Timing {
+            now: 10,
+            ttl: 100,
+            claim_lease_duration: 5,
+        },
+    )
+    .expect_err("expired persisted claim must be rejected");
+    assert!(matches!(error, StoreError::LeaseExpired { .. }));
+    assert_eq!(store.list_events().expect("events load").len(), event_count);
+    assert!(matches!(
+        store.load_guard_record(&guard_id("guard-expired-claim")),
+        Err(StoreError::NotFound {
+            entity: "guard",
+            ..
+        })
+    ));
+}
+
+#[test]
+fn persisted_lease_arithmetic_overflow_fails_closed() {
+    let directory = tempdir().expect("temporary directory creates");
+    let path = directory.path().join("overflow.sqlite");
+    let mut store = SqliteStore::open(&path).expect("store opens");
+    prepare_claimed_store(&mut store);
+    drop(store);
+
+    let connection = Connection::open(&path).expect("database reopens");
+    connection
+        .execute(
+            "UPDATE claims SET last_heartbeat = ?1 WHERE commitment_id = ?2",
+            rusqlite::params![i64::MAX, "commitment-1"],
+        )
+        .expect("test heartbeat update succeeds");
+    drop(connection);
+
+    let mut store = SqliteStore::open(&path).expect("store reopens");
+    let event_count = store.list_events().expect("events load").len();
+    let error = issue(
+        &mut store,
+        "guard-overflow",
+        "commitment-1",
+        ClaimEpoch::initial(),
+        "worker-1",
+        vec![scope("overflow")],
+        Timing {
+            now: 0,
+            ttl: 1,
+            claim_lease_duration: u64::MAX,
+        },
+    )
+    .expect_err("overflow must reject guard issuance");
+
+    assert!(matches!(
+        error,
+        StoreError::Domain(resolve_core::DomainError::TimeOverflow)
+    ));
+    assert_eq!(store.list_events().expect("events load").len(), event_count);
+    assert!(matches!(
+        store.load_guard_record(&guard_id("guard-overflow")),
+        Err(StoreError::NotFound {
+            entity: "guard",
+            ..
+        })
+    ));
+}
+
+#[test]
+fn shorter_guard_ttl_wins_over_remaining_claim_lease() {
+    let mut store = claimed_store();
+    let guard = issue(
+        &mut store,
+        "guard-short-ttl",
+        "commitment-1",
+        ClaimEpoch::initial(),
+        "worker-1",
+        vec![scope("short-ttl")],
+        Timing {
+            now: 10,
+            ttl: 5,
+            claim_lease_duration: 100,
+        },
+    )
+    .expect("guard issues");
+
+    assert_eq!(
+        guard.reservation_expires_at(),
+        MonotonicInstant::from_ticks(15)
+    );
+}
+
+#[test]
+fn shorter_remaining_claim_lease_wins_over_guard_ttl() {
+    let mut store = claimed_store();
+    let guard = issue(
+        &mut store,
+        "guard-short-claim",
+        "commitment-1",
+        ClaimEpoch::initial(),
+        "worker-1",
+        vec![scope("short-claim")],
+        Timing {
+            now: 3,
+            ttl: 100,
+            claim_lease_duration: 5,
+        },
+    )
+    .expect("guard issues while claim remains live");
+
+    assert_eq!(
+        guard.reservation_expires_at(),
+        MonotonicInstant::from_ticks(6)
+    );
 }
 
 #[test]
@@ -153,7 +330,7 @@ fn issuance_canonicalizes_scopes_and_binds_guard_metadata() {
         Timing {
             now: 10,
             ttl: 20,
-            claim_deadline: 100,
+            claim_lease_duration: 99,
         },
     )
     .expect("guard issues");
@@ -185,7 +362,7 @@ fn admission_promotes_reservations_and_freezes_outstanding_action_atomically() {
         Timing {
             now: 10,
             ttl: 20,
-            claim_deadline: 100,
+            claim_lease_duration: 99,
         },
     )
     .expect("guard issues");
@@ -193,7 +370,7 @@ fn admission_promotes_reservations_and_freezes_outstanding_action_atomically() {
     let error = store
         .admit_guard(
             &guard_id("guard-1"),
-            vec![scope("a")],
+            scope_set(vec![scope("a")]),
             action("action-1"),
             MonotonicInstant::from_ticks(15),
         )
@@ -204,7 +381,7 @@ fn admission_promotes_reservations_and_freezes_outstanding_action_atomically() {
         store
             .admit_guard(
                 &guard_id("guard-1"),
-                vec![scope("a"), scope("b"), scope("a")],
+                scope_set(vec![scope("a"), scope("b"), scope("a")]),
                 action("action-1"),
                 MonotonicInstant::from_ticks(15),
             )
@@ -231,7 +408,7 @@ fn admission_promotes_reservations_and_freezes_outstanding_action_atomically() {
         store
             .admit_guard(
                 &guard_id("guard-1"),
-                vec![scope("b"), scope("a")],
+                scope_set(vec![scope("b"), scope("a")]),
                 action("action-1"),
                 MonotonicInstant::from_ticks(16),
             )
@@ -254,14 +431,14 @@ fn held_scope_survives_worker_lease_expiry_and_blocks_conflicting_guard() {
         Timing {
             now: 10,
             ttl: 10,
-            claim_deadline: 20,
+            claim_lease_duration: 19,
         },
     )
     .expect("guard issues");
     store
         .admit_guard(
             &guard_id("guard-1"),
-            vec![scope("exclusive")],
+            scope_set(vec![scope("exclusive")]),
             action("action-1"),
             MonotonicInstant::from_ticks(15),
         )
@@ -277,7 +454,7 @@ fn held_scope_survives_worker_lease_expiry_and_blocks_conflicting_guard() {
         Timing {
             now: 100,
             ttl: 10,
-            claim_deadline: 200,
+            claim_lease_duration: 199,
         },
     )
     .expect_err("held scope remains fenced after lease expiry");
@@ -298,7 +475,7 @@ fn expired_reservations_are_released_reactively_with_typed_event() {
         Timing {
             now: 10,
             ttl: 10,
-            claim_deadline: 100,
+            claim_lease_duration: 99,
         },
     )
     .expect("first reservation issues");
@@ -312,7 +489,7 @@ fn expired_reservations_are_released_reactively_with_typed_event() {
         Timing {
             now: 20,
             ttl: 10,
-            claim_deadline: 100,
+            claim_lease_duration: 99,
         },
     )
     .expect("expired reservation is reclaimed on relevant operation");
@@ -346,7 +523,7 @@ fn stale_epoch_and_invalid_claim_requests_cannot_issue_or_mutate_guards() {
         Timing {
             now: 10,
             ttl: 10,
-            claim_deadline: 100,
+            claim_lease_duration: 99,
         },
     )
     .expect_err("stale epoch cannot issue a guard");
@@ -376,7 +553,7 @@ fn claims_from_an_older_boot_generation_are_fenced() {
         Timing {
             now: 10,
             ttl: 10,
-            claim_deadline: 100,
+            claim_lease_duration: 99,
         },
     )
     .expect_err("old boot claim cannot issue a guard");
@@ -398,7 +575,7 @@ fn multi_scope_conflict_is_all_or_nothing() {
         Timing {
             now: 10,
             ttl: 20,
-            claim_deadline: 100,
+            claim_lease_duration: 99,
         },
     )
     .expect("first guard issues");
@@ -412,7 +589,7 @@ fn multi_scope_conflict_is_all_or_nothing() {
         Timing {
             now: 10,
             ttl: 20,
-            claim_deadline: 100,
+            claim_lease_duration: 99,
         },
     )
     .expect_err("one conflicting scope rejects the whole request");
@@ -427,7 +604,7 @@ fn multi_scope_conflict_is_all_or_nothing() {
         Timing {
             now: 10,
             ttl: 20,
-            claim_deadline: 100,
+            claim_lease_duration: 99,
         },
     )
     .expect("non-conflicting scope was not partially reserved");
@@ -447,7 +624,7 @@ fn explicit_invalidation_releases_only_unadmitted_reservations() {
         Timing {
             now: 10,
             ttl: 20,
-            claim_deadline: 100,
+            claim_lease_duration: 99,
         },
     )
     .expect("reservation issues");
@@ -477,7 +654,7 @@ fn explicit_invalidation_releases_only_unadmitted_reservations() {
         Timing {
             now: 15,
             ttl: 20,
-            claim_deadline: 100,
+            claim_lease_duration: 99,
         },
     )
     .expect("invalidated reservation is released");

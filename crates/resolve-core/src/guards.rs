@@ -41,7 +41,7 @@ impl MonotonicDuration {
         self.0
     }
 
-    fn deadline_from(self, now: MonotonicInstant) -> Result<MonotonicInstant, DomainError> {
+    pub fn deadline_from(self, now: MonotonicInstant) -> Result<MonotonicInstant, DomainError> {
         now.ticks()
             .checked_add(self.0)
             .map(MonotonicInstant::from_ticks)
@@ -49,8 +49,33 @@ impl MonotonicDuration {
     }
 }
 
+/// A validated, canonical, non-empty set of exact opaque scope keys.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ScopeSet(Vec<ScopeKey>);
+
+impl ScopeSet {
+    pub fn try_new(scope_keys: Vec<ScopeKey>) -> Result<Self, DomainError> {
+        if scope_keys.is_empty() {
+            return Err(DomainError::EmptyScopeSet);
+        }
+        Ok(Self(canonicalize_scope_keys(scope_keys)))
+    }
+
+    pub fn as_slice(&self) -> &[ScopeKey] {
+        &self.0
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
 /// Canonicalize exact opaque keys for deterministic locking and persistence.
-pub fn canonicalize_scope_keys(mut scope_keys: Vec<ScopeKey>) -> Vec<ScopeKey> {
+fn canonicalize_scope_keys(mut scope_keys: Vec<ScopeKey>) -> Vec<ScopeKey> {
     scope_keys.sort_unstable();
     scope_keys.dedup();
     scope_keys
@@ -77,7 +102,7 @@ pub struct ExecutionGuard {
     guard_id: GuardId,
     commitment_id: CommitmentId,
     claim_epoch: ClaimEpoch,
-    scope_keys: Vec<ScopeKey>,
+    scope_set: ScopeSet,
     boot_generation: BootGeneration,
     state: GuardState,
     reservation_expires_at: MonotonicInstant,
@@ -90,7 +115,7 @@ impl ExecutionGuard {
         guard_id: GuardId,
         commitment_id: CommitmentId,
         claim_epoch: ClaimEpoch,
-        scope_keys: Vec<ScopeKey>,
+        scope_set: ScopeSet,
         boot_generation: BootGeneration,
         reservation_expires_at: MonotonicInstant,
     ) -> Self {
@@ -98,7 +123,7 @@ impl ExecutionGuard {
             guard_id,
             commitment_id,
             claim_epoch,
-            scope_keys: canonicalize_scope_keys(scope_keys),
+            scope_set,
             boot_generation,
             state: GuardState::Issued,
             reservation_expires_at,
@@ -110,7 +135,7 @@ impl ExecutionGuard {
         guard_ttl: MonotonicDuration,
         claim_lease_deadline: MonotonicInstant,
     ) -> Result<MonotonicInstant, DomainError> {
-        if claim_lease_deadline < now {
+        if claim_lease_deadline <= now {
             return Err(DomainError::InvalidLeaseDeadline);
         }
         Ok(guard_ttl.deadline_from(now)?.min(claim_lease_deadline))
@@ -129,7 +154,7 @@ impl ExecutionGuard {
     }
 
     pub fn scope_keys(&self) -> &[ScopeKey] {
-        &self.scope_keys
+        self.scope_set.as_slice()
     }
 
     pub fn boot_generation(&self) -> BootGeneration {
@@ -174,6 +199,14 @@ mod tests {
     }
 
     #[test]
+    fn empty_scope_sets_are_rejected_at_the_domain_boundary() {
+        assert_eq!(
+            ScopeSet::try_new(Vec::new()).expect_err("empty scope set is invalid"),
+            DomainError::EmptyScopeSet
+        );
+    }
+
+    #[test]
     fn reservation_deadline_uses_the_earlier_validated_bound() {
         let deadline = ExecutionGuard::reservation_deadline(
             MonotonicInstant::from_ticks(10),
@@ -195,6 +228,26 @@ mod tests {
             .expect_err("past claim deadline is invalid"),
             DomainError::InvalidLeaseDeadline
         );
+        assert_eq!(
+            ExecutionGuard::reservation_deadline(
+                MonotonicInstant::from_ticks(10),
+                MonotonicDuration::try_from_ticks(1).expect("duration is valid"),
+                MonotonicInstant::from_ticks(10),
+            )
+            .expect_err("claim expiring at now is invalid"),
+            DomainError::InvalidLeaseDeadline
+        );
+    }
+
+    #[test]
+    fn lease_deadline_overflow_fails_closed() {
+        assert_eq!(
+            MonotonicDuration::try_from_ticks(1)
+                .expect("duration is valid")
+                .deadline_from(MonotonicInstant::from_ticks(u64::MAX))
+                .expect_err("overflow must be rejected"),
+            DomainError::TimeOverflow
+        );
     }
 
     #[test]
@@ -203,7 +256,8 @@ mod tests {
             guard_id(),
             commitment_id(),
             ClaimEpoch::initial(),
-            vec![ScopeKey::try_new("scope").expect("scope is valid")],
+            ScopeSet::try_new(vec![ScopeKey::try_new("scope").expect("scope is valid")])
+                .expect("scope set is valid"),
             BootGeneration::from_raw(3),
             MonotonicInstant::from_ticks(20),
         );

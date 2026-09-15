@@ -3,7 +3,10 @@
 This is the boundary between Resolve and Tethers in R0.
 
 Resolve supplies a generic guard containing an identifier, claim epoch,
-opaque scope information, and boot generation. S3 models the Tethers admission
+opaque scope information, and boot generation. Every guarded consequential
+action must supply at least one real opaque authoritative `ScopeKey`, even if
+the action is otherwise intended to be unrestricted; Resolve never substitutes
+a dummy or global key. S3 models the Tethers admission
 boundary with a store operation; a future Tethers adapter will validate that
 guard at action admission against the action scope. Tethers does not inspect Goal,
 Commitment, parent, dependency, or Resolve-plan concepts.
