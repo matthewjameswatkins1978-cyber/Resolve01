@@ -22,6 +22,8 @@ Resolve records the outcome and updates its live coordination state. It does
 not execute the action, apply Tethers policy, or reinterpret `UNCERTAIN` as
 `FAILED`.
 
-S3 has no Tethers integration or execution capability. The S3 mock admission
-path records only the opaque action reference and exact scope match; policy and
-execution remain Tethers-owned.
+S3 has no Tethers integration or execution capability. Resolve may issue the
+guard and reserve its scopes while the commitment is `CLAIMED`, but the mock
+admission path requires the commitment to be explicitly `WORKING` before it
+records the opaque action reference and exact scope match. Admission does not
+start the commitment; policy and execution remain Tethers-owned.

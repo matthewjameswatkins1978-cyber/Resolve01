@@ -37,13 +37,15 @@ arithmetic overflow fail closed. Scope availability and reservation rows are
 established in one `BEGIN IMMEDIATE` transaction.
 
 Admission requires the guard to be issued, unexpired, current-boot, and still
-backed by every exact reserved scope row. It promotes all reservations to
-`Held`, records the typed action reference on the commitment, and appends
-`GuardAdmitted` atomically. Repeating the same admission is idempotent; a
-different action or scope set is rejected. Explicit invalidation is available
-for an unadmitted current-claim guard. Expired reservations are invalidated
-reactively during relevant scope operations and append
-`GuardReservationExpired`; no background sweeper exists.
+backed by every exact reserved scope row. Resolve may reserve scope while the
+commitment is `CLAIMED`, but consequential Tethers admission requires the
+commitment to have explicitly entered `WORKING`; admission does not start it.
+It promotes all reservations to `Held`, records the typed action reference on
+the commitment, and appends `GuardAdmitted` atomically. Repeating the same
+admission is idempotent; a different action or scope set is rejected. Explicit
+invalidation is available for an unadmitted current-claim guard. Expired
+reservations are invalidated reactively during relevant scope operations and
+append `GuardReservationExpired`; no background sweeper exists.
 
 `GuardState::Resolved` and `GuardState::Uncertain` are present as typed domain
 states for the frozen R0 vocabulary, but outcome handling and recovery remain

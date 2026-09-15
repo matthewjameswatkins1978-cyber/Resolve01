@@ -1,7 +1,7 @@
 use resolve_core::{
-    BootGeneration, ClaimEpoch, Commitment, CommitmentId, ExecutionGuard, GoalId, GoalRevision,
-    GoalSpec, GoalState, GuardId, GuardState, MonotonicDuration, MonotonicInstant, ScopeKey,
-    ScopeSet, TethersActionRef, Timestamp, WorkEvent, WorkerId,
+    BootGeneration, ClaimEpoch, ClaimLease, Commitment, CommitmentId, ExecutionGuard, GoalId,
+    GoalRevision, GoalSpec, GoalState, GuardId, GuardState, MonotonicDuration, MonotonicInstant,
+    ScopeKey, ScopeSet, TethersActionRef, Timestamp, WorkEvent, WorkerId,
 };
 use resolve_store::{GuardAdmission, GuardIssueRequest, SqliteStore, StoreError};
 use rusqlite::Connection;
@@ -35,12 +35,12 @@ fn scope_set(values: Vec<ScopeKey>) -> ScopeSet {
     ScopeSet::try_new(values).expect("test scope set is valid")
 }
 
-fn add_claimed_commitment(
+fn add_claimed_commitment_with_claim(
     store: &mut SqliteStore,
     id: &str,
     worker: &str,
     heartbeat: u64,
-) -> ClaimEpoch {
+) -> (Commitment, ClaimLease) {
     let id = commitment_id(id);
     let mut commitment = Commitment::new(
         id.clone(),
@@ -87,10 +87,21 @@ fn add_claimed_commitment(
             3,
         )
         .expect("claim persists");
-    claim.epoch()
+    (commitment, claim)
 }
 
-fn prepare_claimed_store(store: &mut SqliteStore) {
+fn add_claimed_commitment(
+    store: &mut SqliteStore,
+    id: &str,
+    worker: &str,
+    heartbeat: u64,
+) -> ClaimEpoch {
+    add_claimed_commitment_with_claim(store, id, worker, heartbeat)
+        .1
+        .epoch()
+}
+
+fn prepare_goal_store(store: &mut SqliteStore) {
     let goal = GoalSpec::new(
         goal_id(),
         GoalRevision::initial(),
@@ -111,12 +122,49 @@ fn prepare_claimed_store(store: &mut SqliteStore) {
     store
         .set_boot_generation(BootGeneration::from_raw(7))
         .expect("boot generation sets");
+}
+
+fn prepare_claimed_store(store: &mut SqliteStore) {
+    prepare_goal_store(store);
     add_claimed_commitment(store, "commitment-1", "worker-1", 1);
+}
+
+fn prepare_working_store(store: &mut SqliteStore) {
+    prepare_goal_store(store);
+    let (mut commitment, claim) =
+        add_claimed_commitment_with_claim(store, "commitment-1", "worker-1", 1);
+    commitment
+        .start(claim.worker_id(), claim.epoch())
+        .expect("current claimant starts work");
+    store
+        .persist_commitment_change(
+            &commitment,
+            3,
+            &WorkEvent::CommitmentStarted {
+                commitment_id: commitment.commitment_id().clone(),
+            },
+            4,
+        )
+        .expect("working state persists");
 }
 
 fn claimed_store() -> SqliteStore {
     let mut store = SqliteStore::open_in_memory_for_tests().expect("store opens");
     prepare_claimed_store(&mut store);
+    store
+}
+
+fn claimed_store_with_local_commitment() -> (SqliteStore, Commitment, ClaimLease) {
+    let mut store = SqliteStore::open_in_memory_for_tests().expect("store opens");
+    prepare_goal_store(&mut store);
+    let (commitment, claim) =
+        add_claimed_commitment_with_claim(&mut store, "commitment-1", "worker-1", 1);
+    (store, commitment, claim)
+}
+
+fn working_store() -> SqliteStore {
+    let mut store = SqliteStore::open_in_memory_for_tests().expect("store opens");
+    prepare_working_store(&mut store);
     store
 }
 
@@ -164,6 +212,119 @@ fn empty_scope_set_is_rejected_without_store_mutation() {
             ..
         })
     ));
+}
+
+#[test]
+fn claimed_commitment_must_start_before_admission() {
+    let (mut store, mut commitment, claim) = claimed_store_with_local_commitment();
+    issue(
+        &mut store,
+        "guard-claimed",
+        "commitment-1",
+        claim.epoch(),
+        "worker-1",
+        vec![scope("claimed-admission")],
+        Timing {
+            now: 10,
+            ttl: 20,
+            claim_lease_duration: 99,
+        },
+    )
+    .expect("guard issuance remains valid while claimed");
+    let event_count = store.list_events().expect("events load").len();
+
+    let error = store
+        .admit_guard(
+            &guard_id("guard-claimed"),
+            scope_set(vec![scope("claimed-admission")]),
+            action("action-claimed"),
+            MonotonicInstant::from_ticks(15),
+        )
+        .expect_err("claimed commitment cannot admit consequential work");
+    assert!(matches!(error, StoreError::GuardInvalid { .. }));
+    assert_eq!(store.list_events().expect("events load").len(), event_count);
+    assert!(
+        !store
+            .list_events()
+            .expect("events load")
+            .iter()
+            .any(|event| event.event_type() == "guard_admitted")
+    );
+    let guard = store
+        .load_guard_record(&guard_id("guard-claimed"))
+        .expect("issued guard remains present");
+    assert_eq!(guard.state(), &GuardState::Issued);
+    assert_eq!(
+        guard.reservation_expires_at(),
+        Some(MonotonicInstant::from_ticks(30))
+    );
+    assert!(
+        store
+            .load_commitment_record(&commitment_id("commitment-1"))
+            .expect("commitment loads")
+            .outstanding_action()
+            .is_none()
+    );
+
+    let second_epoch = add_claimed_commitment(&mut store, "commitment-2", "worker-2", 1);
+    let lock_error = issue(
+        &mut store,
+        "guard-conflict",
+        "commitment-2",
+        second_epoch,
+        "worker-2",
+        vec![scope("claimed-admission")],
+        Timing {
+            now: 15,
+            ttl: 20,
+            claim_lease_duration: 99,
+        },
+    )
+    .expect_err("reserved scope remains locked after failed admission");
+    assert!(matches!(lock_error, StoreError::ScopeLocked { .. }));
+
+    commitment
+        .start(claim.worker_id(), claim.epoch())
+        .expect("current claimant starts work explicitly");
+    store
+        .persist_commitment_change(
+            &commitment,
+            3,
+            &WorkEvent::CommitmentStarted {
+                commitment_id: commitment.commitment_id().clone(),
+            },
+            4,
+        )
+        .expect("working state persists");
+    assert_eq!(commitment.state(), &resolve_core::CommitmentState::Working);
+
+    assert_eq!(
+        store
+            .admit_guard(
+                &guard_id("guard-claimed"),
+                scope_set(vec![scope("claimed-admission")]),
+                action("action-claimed"),
+                MonotonicInstant::from_ticks(20),
+            )
+            .expect("working commitment admits before reservation expiry"),
+        GuardAdmission::Admitted
+    );
+    assert_eq!(
+        store
+            .load_guard_record(&guard_id("guard-claimed"))
+            .expect("admitted guard loads")
+            .state(),
+        &GuardState::Admitted {
+            action_ref: action("action-claimed")
+        }
+    );
+    assert_eq!(
+        store
+            .load_commitment_record(&commitment_id("commitment-1"))
+            .expect("working commitment loads")
+            .outstanding_action(),
+        Some(&action("action-claimed"))
+    );
 }
 
 #[test]
@@ -351,7 +512,7 @@ fn issuance_canonicalizes_scopes_and_binds_guard_metadata() {
 
 #[test]
 fn admission_promotes_reservations_and_freezes_outstanding_action_atomically() {
-    let mut store = claimed_store();
+    let mut store = working_store();
     issue(
         &mut store,
         "guard-1",
@@ -419,7 +580,7 @@ fn admission_promotes_reservations_and_freezes_outstanding_action_atomically() {
 
 #[test]
 fn held_scope_survives_worker_lease_expiry_and_blocks_conflicting_guard() {
-    let mut store = claimed_store();
+    let mut store = working_store();
     let epoch = add_claimed_commitment(&mut store, "commitment-2", "worker-2", 1);
     issue(
         &mut store,
