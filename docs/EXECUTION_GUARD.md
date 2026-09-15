@@ -16,7 +16,7 @@ Issuance reserves exact scope keys. Admission promotes those reservations to
 held locks atomically with the outstanding action reference. Held locks are
 not released by worker lease expiry or guard-token expiry.
 
-S3 implements the guard boundary in `resolve-core` and the synchronous SQLite
+S3 and S4 implement the guard boundary in `resolve-core` and the synchronous SQLite
 operations in `resolve-store`. A guard's validated `ScopeSet` must contain at
 least one `ScopeKey`; an empty scope set cannot reach guard issuance. Tethers
 must therefore provide at least one real opaque authoritative `ScopeKey` for
@@ -47,7 +47,18 @@ invalidation is available for an unadmitted current-claim guard. Expired
 reservations are invalidated reactively during relevant scope operations and
 append `GuardReservationExpired`; no background sweeper exists.
 
-`GuardState::Resolved` and `GuardState::Uncertain` are present as typed domain
-states for the frozen R0 vocabulary, but outcome handling and recovery remain
-S4 work. S3 does not execute actions, apply Tethers policy, release held locks
-on outcomes, or implement restart recovery.
+`GuardState::Resolved` and `GuardState::Uncertain` are typed domain states.
+S4 records Tethers outcomes transactionally: safe outcomes resolve the guard,
+clear the outstanding action, and release its held locks; `UNCERTAIN` retains
+the action and held locks and moves the commitment to
+`WAITING(UncertainAction(action_ref))`. A normal resume cannot bypass that
+recovery requirement.
+
+On file-backed startup, Resolve advances the boot generation in one immediate
+transaction, invalidates active claims and issued reservations, and rebuilds
+held locks from consistent admitted/uncertain guards. A restart never releases
+an admitted held lock merely because its worker claim ended. Expiry processing
+has the same distinction: issued reservations are invalidated, while admitted
+actions remain fenced for outcome handling. The in-memory constructor remains a
+test-only deterministic constructor and does not perform automatic startup
+recovery.

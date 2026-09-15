@@ -28,14 +28,23 @@ operations validate the current worker and claim epoch before changing state.
 (retaining it). `claim_for` creates the next typed epoch rather than accepting
 an epoch supplied by a worker.
 
+S4 adds the recovery boundary without adding new planning or execution states.
+An expired claim or a restart moves active `CLAIMED`/`WORKING` work to
+`RECOVERY_PENDING` and clears its active claim. A commitment with no outstanding
+action may be explicitly released from recovery to `READY`, recording
+`RecoveryReleased`; the next claim uses the persisted epoch high-water mark.
+An admitted action may remain outstanding in `RECOVERY_PENDING` until its
+authoritative Tethers outcome is recorded.
+
 Guard issuance may reserve scope while a commitment is `CLAIMED`, preserving
 the pre-admission fence. Consequential Tethers admission requires the
 commitment to have explicitly entered `WORKING`; admission does not perform the
 `CLAIMED -> WORKING` transition.
 
-The full transition contract, including lease expiry, restart invalidation,
-waiting reasons, and recovery, is frozen by Issue #1. S1 establishes the
-commitment transitions; S2 adds persistence; S3 adds fencing and records an
-outstanding action only through the atomic guard-admission boundary. Lease
-expiry, restart recovery, outcome handling, structural planning, and service
-layers remain unimplemented.
+`UNCERTAIN` is represented as
+`WAITING(UncertainAction(action_ref))`, retains the outstanding action and held
+scope locks, and cannot be resumed through the ordinary `resume` API. A safe
+Tethers outcome clears the action and held locks atomically; when recovery was
+pending it also returns the commitment to `READY`, otherwise the commitment
+remains `WORKING`. Contradictory or repeated outcomes are handled by the store's
+typed outcome boundary.

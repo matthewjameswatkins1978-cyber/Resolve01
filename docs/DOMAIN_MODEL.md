@@ -33,21 +33,22 @@ enum. Claimant mutations require both the current `WorkerId` and
 All commitment fields are private. Callers receive IDs and parent references,
 descriptions, prerequisite and acceptance slices, state, claim, and
 outstanding-action references through read-only accessors. The outstanding
-action is intentionally read-only until the controlled guard/action lifecycle
-is introduced in S3/S4.
+action is intentionally read-only; S4 changes it only through the controlled
+guard/outcome lifecycle at the store boundary.
 
 `Prerequisite` has exactly the three R0 forms: commitment, Tethers
 verification, and human decision. `WaitingReason` keeps prerequisite,
 authority, human-decision, verification, uncertain-action, and external
 waiting semantically distinct. `TethersOutcome` likewise has distinct
-`Succeeded`, `Failed`, and `Uncertain` variants; S1 provides no outcome
-recording or reconciliation behavior.
+`Succeeded`, `Failed`, and `Uncertain` variants. The S4 store boundary records
+outcomes by their typed action reference; `Uncertain` remains fenced and is
+never collapsed into `Failed`.
 
 `AttentionItem` models asynchronous operational escalation, and `WorkEvent`
-is a closed enum covering the R0 event vocabulary. S1 defines these values but
-does not yet append events to storage. `AttentionItem::new` creates an open
-item after validating its description; its state and description are
-read-only, with no attention workflow implemented.
+is a closed enum covering the R0 event vocabulary, including recovery and
+heartbeat/outcome events. `AttentionItem::new` creates an open item after
+validating its description; its state and description are read-only, with no
+attention workflow implemented.
 
 ## Execution guards
 
@@ -55,7 +56,6 @@ read-only, with no attention workflow implemented.
 scope set by deterministic ordering and exact de-duplication; it does not
 interpret resource names or path relationships. `ExecutionGuard` has private
 identity, claim, scope, boot-generation, lifecycle, and reservation fields and
-is constructed only as an issued guard. Its typed `GuardState` includes the
-future resolved and uncertain forms, while S3 implements only `Issued`,
-`Admitted`, and `Invalidated` transitions. `MonotonicDuration` and
+is constructed only as an issued guard. Its typed `GuardState` includes
+issued, admitted, resolved, uncertain, and invalidated forms. `MonotonicDuration` and
 `MonotonicInstant` make reservation TTL and claim deadlines explicit.

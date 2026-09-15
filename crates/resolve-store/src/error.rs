@@ -38,6 +38,17 @@ pub enum StoreError {
         commitment_id: String,
         reason: String,
     },
+    OutstandingAction {
+        commitment_id: String,
+        action_ref: String,
+    },
+    OutcomeConflict {
+        action_ref: String,
+    },
+    RecoveryBlocked {
+        commitment_id: String,
+        reason: String,
+    },
     LeaseExpired {
         commitment_id: String,
     },
@@ -89,6 +100,24 @@ impl fmt::Display for StoreError {
             } => write!(
                 formatter,
                 "commitment {commitment_id} claim mismatch: {reason}"
+            ),
+            Self::OutstandingAction {
+                commitment_id,
+                action_ref,
+            } => write!(
+                formatter,
+                "commitment {commitment_id} has unresolved Tethers action {action_ref}"
+            ),
+            Self::OutcomeConflict { action_ref } => write!(
+                formatter,
+                "conflicting outcome received for Tethers action {action_ref}"
+            ),
+            Self::RecoveryBlocked {
+                commitment_id,
+                reason,
+            } => write!(
+                formatter,
+                "commitment {commitment_id} cannot recover: {reason}"
             ),
             Self::LeaseExpired { commitment_id } => {
                 write!(

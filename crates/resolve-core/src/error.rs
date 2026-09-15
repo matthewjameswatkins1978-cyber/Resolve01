@@ -1,4 +1,4 @@
-use crate::domain::{ClaimEpoch, CommitmentState, GoalRevision, WorkerId};
+use crate::domain::{ClaimEpoch, CommitmentState, GoalRevision, TethersActionRef, WorkerId};
 use std::fmt;
 
 /// Errors raised when a domain request would violate a Resolve invariant.
@@ -41,6 +41,12 @@ pub enum DomainError {
         kind: &'static str,
     },
     EmptyScopeSet,
+    RecoveryRequired {
+        action_ref: TethersActionRef,
+    },
+    InvalidRestoredState {
+        reason: &'static str,
+    },
 }
 
 impl fmt::Display for DomainError {
@@ -92,6 +98,15 @@ impl fmt::Display for DomainError {
                 write!(formatter, "{kind} value is outside its valid range")
             }
             Self::EmptyScopeSet => formatter.write_str("a guard scope set must not be empty"),
+            Self::RecoveryRequired { action_ref } => {
+                write!(
+                    formatter,
+                    "recovery is required for outstanding action {action_ref}"
+                )
+            }
+            Self::InvalidRestoredState { reason } => {
+                write!(formatter, "persisted commitment state is invalid: {reason}")
+            }
         }
     }
 }
