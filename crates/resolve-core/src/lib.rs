@@ -12,7 +12,5 @@ pub use domain::{
     TethersContractRef, TethersOutcome, Timestamp, WaitingReason, WorkEvent, WorkerId,
 };
 pub use error::DomainError;
-pub use guards::{
-    ExecutionGuard, GuardState, MonotonicDuration, ScopeKey, canonicalize_scope_keys,
-};
+pub use guards::{ExecutionGuard, GuardState, MonotonicDuration, ScopeKey, ScopeSet};
 pub use state_machine::ResumeTarget;

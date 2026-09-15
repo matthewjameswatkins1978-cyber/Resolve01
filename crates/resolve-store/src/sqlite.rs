@@ -4,8 +4,8 @@ use resolve_core::{
     AcceptanceRef, AttentionId, AttentionItem, AttentionState, BootGeneration, ClaimEpoch,
     ClaimLease, Commitment, CommitmentId, CommitmentState, ExecutionGuard, GoalId, GoalSpec,
     GoalState, GuardId, GuardState, HumanDecisionRef, MonotonicDuration, MonotonicInstant,
-    Prerequisite, ScopeKey, TethersActionRef, TethersContractRef, TethersOutcome, WaitingReason,
-    WorkEvent, WorkerId, canonicalize_scope_keys,
+    Prerequisite, ScopeKey, ScopeSet, TethersActionRef, TethersContractRef, TethersOutcome,
+    WaitingReason, WorkEvent, WorkerId,
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
@@ -209,7 +209,7 @@ pub struct GuardRecord {
     guard_id: GuardId,
     commitment_id: CommitmentId,
     claim_epoch: ClaimEpoch,
-    scope_keys: Vec<ScopeKey>,
+    scope_keys: ScopeSet,
     boot_generation: BootGeneration,
     state: GuardState,
     reservation_expires_at: Option<MonotonicInstant>,
@@ -229,7 +229,7 @@ impl GuardRecord {
     }
 
     pub fn scope_keys(&self) -> &[ScopeKey] {
-        &self.scope_keys
+        self.scope_keys.as_slice()
     }
 
     pub fn boot_generation(&self) -> BootGeneration {
@@ -257,11 +257,11 @@ pub struct GuardIssueRequest {
     pub commitment_id: CommitmentId,
     pub worker_id: WorkerId,
     pub claim_epoch: ClaimEpoch,
-    pub scope_keys: Vec<ScopeKey>,
+    pub scope_keys: ScopeSet,
     pub boot_generation: BootGeneration,
     pub now: MonotonicInstant,
     pub guard_ttl: MonotonicDuration,
-    pub claim_lease_deadline: MonotonicInstant,
+    pub claim_lease_duration: MonotonicDuration,
 }
 
 impl EventRecord {
@@ -621,16 +621,9 @@ impl SqliteStore {
             boot_generation,
             now,
             guard_ttl,
-            claim_lease_deadline,
+            claim_lease_duration,
         } = request;
-        let reservation_expires_at =
-            ExecutionGuard::reservation_deadline(now, guard_ttl, claim_lease_deadline)?;
-        let scope_keys = canonicalize_scope_keys(scope_keys);
         let now_ticks = checked_i64(now.ticks(), "current monotonic instant")?;
-        let reservation_ticks = checked_i64(
-            reservation_expires_at.ticks(),
-            "guard reservation expiration",
-        )?;
         let claim_epoch_ticks = checked_i64(claim_epoch.value(), "claim epoch")?;
         let boot_generation_ticks = checked_i64(boot_generation.value(), "boot generation")?;
         let transaction = self
@@ -659,12 +652,17 @@ impl SqliteStore {
                 reason: "commitment already has an outstanding action".to_owned(),
             });
         }
-        let (stored_worker, stored_epoch, stored_boot_generation): (String, i64, i64) = transaction
+        let (stored_worker, stored_epoch, stored_last_heartbeat, stored_boot_generation): (
+            String,
+            i64,
+            i64,
+            i64,
+        ) = transaction
             .query_row(
-                "SELECT worker_id, claim_epoch, boot_generation
+                "SELECT worker_id, claim_epoch, last_heartbeat, boot_generation
                  FROM claims WHERE commitment_id = ?1",
                 params![commitment_id.as_ref()],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
             .optional()?
             .ok_or_else(|| StoreError::ClaimMismatch {
@@ -694,9 +692,22 @@ impl SqliteStore {
                     .to_owned(),
             });
         }
+        let stored_last_heartbeat = MonotonicInstant::try_from_raw(stored_last_heartbeat)?;
+        let claim_lease_deadline = claim_lease_duration.deadline_from(stored_last_heartbeat)?;
+        if claim_lease_deadline <= now {
+            return Err(StoreError::LeaseExpired {
+                commitment_id: commitment_id.to_string(),
+            });
+        }
+        let reservation_expires_at =
+            ExecutionGuard::reservation_deadline(now, guard_ttl, claim_lease_deadline)?;
+        let reservation_ticks = checked_i64(
+            reservation_expires_at.ticks(),
+            "guard reservation expiration",
+        )?;
 
-        expire_relevant_reservations(&transaction, &scope_keys, now_ticks)?;
-        for scope_key in &scope_keys {
+        expire_relevant_reservations(&transaction, scope_keys.as_slice(), now_ticks)?;
+        for scope_key in scope_keys.as_slice() {
             let lock_owner: Option<String> = transaction
                 .query_row(
                     "SELECT guard_id FROM scope_locks WHERE scope_key = ?1",
@@ -726,7 +737,7 @@ impl SqliteStore {
                 INITIAL_STATE_VERSION,
             ],
         )?;
-        for (ordinal, scope_key) in scope_keys.iter().enumerate() {
+        for (ordinal, scope_key) in scope_keys.as_slice().iter().enumerate() {
             transaction.execute(
                 "INSERT INTO execution_guard_scopes (guard_id, ordinal, scope_key)
                  VALUES (?1, ?2, ?3)",
@@ -772,11 +783,10 @@ impl SqliteStore {
     pub fn admit_guard(
         &mut self,
         guard_id: &GuardId,
-        scope_keys: Vec<ScopeKey>,
+        scope_keys: ScopeSet,
         action_ref: TethersActionRef,
         now: MonotonicInstant,
     ) -> Result<GuardAdmission, StoreError> {
-        let scope_keys = canonicalize_scope_keys(scope_keys);
         let now_ticks = checked_i64(now.ticks(), "current monotonic instant")?;
         let transaction = self
             .connection
@@ -810,7 +820,7 @@ impl SqliteStore {
             }
         }
 
-        expire_relevant_reservations(&transaction, &stored_scope_keys, now_ticks)?;
+        expire_relevant_reservations(&transaction, stored_scope_keys.as_slice(), now_ticks)?;
         guard = query_guard(&transaction, guard_id)?;
         if !matches!(guard.state, GuardState::Issued) {
             return Err(StoreError::LeaseExpired {
@@ -823,7 +833,7 @@ impl SqliteStore {
                 reason: "admission scope set does not exactly match issuance".to_owned(),
             });
         }
-        for scope_key in &stored_scope_keys {
+        for scope_key in stored_scope_keys.as_slice() {
             let lock_matches: bool = transaction.query_row(
                 "SELECT EXISTS(
                     SELECT 1 FROM scope_locks
@@ -998,7 +1008,7 @@ impl SqliteStore {
             });
         }
         let scope_keys = query_guard_scopes(&transaction, guard_id)?;
-        expire_relevant_reservations(&transaction, &scope_keys, now_ticks)?;
+        expire_relevant_reservations(&transaction, scope_keys.as_slice(), now_ticks)?;
         guard = query_guard(&transaction, guard_id)?;
         if !matches!(guard.state, GuardState::Issued) {
             return Err(StoreError::LeaseExpired {
@@ -1438,7 +1448,7 @@ fn decode_guard_row(columns: RawGuardColumns) -> Result<GuardRow, StoreError> {
 fn query_guard_scopes(
     transaction: &Transaction<'_>,
     guard_id: &GuardId,
-) -> Result<Vec<ScopeKey>, StoreError> {
+) -> Result<ScopeSet, StoreError> {
     let mut statement = transaction.prepare(
         "SELECT scope_key FROM execution_guard_scopes
          WHERE guard_id = ?1 ORDER BY ordinal",
@@ -1448,13 +1458,13 @@ fn query_guard_scopes(
     while let Some(row) = rows.next()? {
         scope_keys.push(parse_id(row.get(0)?, "scope", ScopeKey::try_new)?);
     }
-    Ok(scope_keys)
+    Ok(ScopeSet::try_new(scope_keys)?)
 }
 
 fn query_guard_scopes_connection(
     connection: &Connection,
     guard_id: &GuardId,
-) -> Result<Vec<ScopeKey>, StoreError> {
+) -> Result<ScopeSet, StoreError> {
     let mut statement = connection.prepare(
         "SELECT scope_key FROM execution_guard_scopes
          WHERE guard_id = ?1 ORDER BY ordinal",
@@ -1464,7 +1474,7 @@ fn query_guard_scopes_connection(
     while let Some(row) = rows.next()? {
         scope_keys.push(parse_id(row.get(0)?, "scope", ScopeKey::try_new)?);
     }
-    Ok(scope_keys)
+    Ok(ScopeSet::try_new(scope_keys)?)
 }
 
 fn expire_relevant_reservations(

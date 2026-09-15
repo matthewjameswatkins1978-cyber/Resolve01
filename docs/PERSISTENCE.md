@@ -56,7 +56,9 @@ rows, while commitment state is stored as a private tagged JSON projection so
 waiting-reason variants retain their type.
 
 `execution_guards` stores the typed lifecycle projection and reservation
-deadline. `execution_guard_scopes` stores the canonical exact scope set.
+deadline. `execution_guard_scopes` stores the canonical, non-empty exact scope
+set. Guard issuance requires Tethers to provide at least one opaque
+authoritative scope key; Resolve does not invent a dummy or global key.
 `scope_locks` has one row per exact key and distinguishes short-lived
 `reserved` locks from indefinite `held` locks with SQL checks. A migration
 failure rolls back its DDL and metadata version update. Reopening schema v2 is
@@ -78,8 +80,12 @@ The store never silently performs last-writer-wins updates and does not use a
 claim epoch as a substitute for the independent snapshot version.
 
 Guard issuance, reactive reservation expiry, and admission use one
-`BEGIN IMMEDIATE` transaction. Admission promotes reservations and records the
-commitment's outstanding action in the same transaction as `GuardAdmitted`.
+`BEGIN IMMEDIATE` transaction. Issuance treats the persisted claim
+`last_heartbeat` as authoritative, adds only the trusted
+`claim_lease_duration`, and derives the claim deadline inside that transaction;
+an absolute worker-supplied deadline is not part of the API. Admission promotes
+reservations and records the commitment's outstanding action in the same
+transaction as `GuardAdmitted`.
 Held locks are not released by worker lease expiry. S3 contains no outcome,
 recovery, restart, or background-sweeper behavior.
 
