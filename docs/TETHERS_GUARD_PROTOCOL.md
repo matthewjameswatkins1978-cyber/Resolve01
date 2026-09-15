@@ -172,4 +172,3 @@ because exact duplicate delivery is idempotent at this boundary.
 > provider outcome truth.
 
 > Resolve admission cannot grant Tethers permission.
-
