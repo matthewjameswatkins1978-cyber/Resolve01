@@ -28,6 +28,11 @@ operations validate the current worker and claim epoch before changing state.
 (retaining it). `claim_for` creates the next typed epoch rather than accepting
 an epoch supplied by a worker.
 
+Guard issuance may reserve scope while a commitment is `CLAIMED`, preserving
+the pre-admission fence. Consequential Tethers admission requires the
+commitment to have explicitly entered `WORKING`; admission does not perform the
+`CLAIMED -> WORKING` transition.
+
 The full transition contract, including lease expiry, restart invalidation,
 waiting reasons, and recovery, is frozen by Issue #1. S1 establishes the
 commitment transitions; S2 adds persistence; S3 adds fencing and records an

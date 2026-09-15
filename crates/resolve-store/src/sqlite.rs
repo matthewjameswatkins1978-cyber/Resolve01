@@ -880,10 +880,10 @@ impl SqliteStore {
             .optional()?
             .ok_or_else(|| not_found("commitment", guard.commitment_id.to_string()))?;
         let state = decode_commitment_state(&commitment.state_json)?;
-        if !matches!(state, CommitmentState::Claimed | CommitmentState::Working) {
+        if !matches!(state, CommitmentState::Working) {
             return Err(StoreError::GuardInvalid {
                 guard_id: guard_id.to_string(),
-                reason: format!("commitment is in {state:?}, not a work-owning state"),
+                reason: format!("commitment is in {state:?}, not WORKING"),
             });
         }
         if commitment.outstanding_action.is_some() {
