@@ -26,8 +26,9 @@ file-backed databases for WAL tests.
 
 ## Schema ownership
 
-Schema version `3` is recorded in `metadata`. S4 migrates schema version 2 to
-3 transactionally without recreating or discarding earlier data. The store owns
+Schema version `4` is recorded in `metadata`. S4 migrates schema version 2 to
+3, and S5 migrates schema version 3 to 4, transactionally without recreating
+or discarding earlier data. The store owns
 these tables:
 
 ```text
@@ -44,6 +45,12 @@ execution_guards
 execution_guard_scopes
 scope_locks
 ```
+
+Schema v4 adds nullable `commitments.replacement_terminal_id`, a validated
+store-owned link to a direct same-goal child used only for composite-barrier
+completion. Commitment prerequisites remain normalized typed rows; only
+`Prerequisite::Commitment` contributes an edge to the deterministic cycle
+check. No graph database or planning dependency is introduced.
 
 `metadata.boot_generation` is explicit store context. Claims persist the boot
 generation under which they were recorded; guard issuance and admission reject
@@ -98,6 +105,16 @@ heartbeat lease calculation; a heartbeat at or after its derived deadline is
 rejected and cannot resurrect the claim. Held locks are not released by worker
 lease expiry. Safe outcomes release held locks atomically; `UNCERTAIN`
 deliberately retains the action and locks.
+
+Structural proposals use their own immediate transaction. The store rechecks
+the exact current worker claim, epoch, boot generation, state version, and
+guard safety before applying one of the closed proposal forms. Decomposition
+inserts proposed direct children, appends typed child/parent/audit events, and
+records the replacement-terminal link atomically. Add-prerequisite appends one
+normalized row without an automatic state change. Abandonment records the
+normal terminal mutation and rationale evidence. Completion of a replacement
+terminal is followed by a bounded event-reactive barrier cascade; no scheduler
+or background loop is involved.
 
 The domain restoration and startup paths use one additional invariant: when an
 active claim exists, its epoch must equal the commitment's durable

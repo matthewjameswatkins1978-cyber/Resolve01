@@ -10,11 +10,11 @@ long-term memory system.
 
 ## Status
 
-The repository is currently at S3 (fencing). The Rust workspace, S1 domain
-model, SQLite/WAL persistence boundary, ExecutionGuard issuance, and
-Reserved/Held exact-scope admission boundary are implemented. Recovery,
-outcome handling, and structural planning are intentionally not implemented
-yet.
+The repository is currently at S5 (structural planning). The Rust workspace,
+S1 domain model, SQLite/WAL persistence boundary, fenced ExecutionGuard
+issuance/admission, recovery, outcome handling, and the closed R0 structural
+proposal boundary are implemented. Services, schedulers, and planning beyond
+the frozen structural mutations remain intentionally unimplemented.
 
 ## Workspace
 

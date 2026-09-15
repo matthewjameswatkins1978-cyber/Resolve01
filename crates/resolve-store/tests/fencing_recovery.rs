@@ -878,7 +878,7 @@ fn migration_preserves_v1_data_and_reopen_is_idempotent() {
     drop(connection);
 
     let store = SqliteStore::open(&path).expect("v1 migrates");
-    assert_eq!(store.schema_version().expect("version reads"), 3);
+    assert_eq!(store.schema_version().expect("version reads"), 4);
     assert_eq!(
         store
             .load_goal_record(&GoalId::try_new("goal-legacy").expect("id is valid"))
@@ -893,7 +893,7 @@ fn migration_preserves_v1_data_and_reopen_is_idempotent() {
             .expect("reopen succeeds")
             .schema_version()
             .expect("version reads"),
-        3
+        4
     );
 }
 

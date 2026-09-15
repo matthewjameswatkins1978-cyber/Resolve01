@@ -63,3 +63,21 @@ identity, claim, scope, boot-generation, lifecycle, and reservation fields and
 is constructed only as an issued guard. Its typed `GuardState` includes
 issued, admitted, resolved, uncertain, and invalidated forms. `MonotonicDuration` and
 `MonotonicInstant` make reservation TTL and claim deadlines explicit.
+
+## Structural proposals
+
+S5 adds the closed `StructuralProposal` enum in `resolve-core`. It contains
+only `Decompose`, `AddPrerequisite`, and `Abandon`, each carrying a typed
+commitment target and claim epoch. `NewCommitment` is a validated child value;
+it exposes only its ID, description, typed prerequisites, and acceptance
+references. The pure planning boundary checks proposal shape and deterministic
+typed commitment-graph acyclicity. It does not choose a plan, schedule work,
+or call SQLite.
+
+The store applies a proposal only inside one immediate transaction after
+rechecking the current worker, claim epoch, boot generation, state, and guard
+fence. Decomposition creates direct same-goal proposed children, keeps the
+parent identity, records a replacement-terminal child, and makes the parent
+wait on that typed prerequisite. Adding a prerequisite does not automatically
+change state. Abandonment requires a non-empty rationale and clears the active
+claim through the normal terminal operation.

@@ -47,6 +47,10 @@ pub enum DomainError {
     InvalidRestoredState {
         reason: &'static str,
     },
+    DependencyCycle,
+    InvalidStructuralProposal {
+        reason: &'static str,
+    },
 }
 
 impl fmt::Display for DomainError {
@@ -106,6 +110,12 @@ impl fmt::Display for DomainError {
             }
             Self::InvalidRestoredState { reason } => {
                 write!(formatter, "persisted commitment state is invalid: {reason}")
+            }
+            Self::DependencyCycle => {
+                formatter.write_str("structural proposal introduces a dependency cycle")
+            }
+            Self::InvalidStructuralProposal { reason } => {
+                write!(formatter, "invalid structural proposal: {reason}")
             }
         }
     }

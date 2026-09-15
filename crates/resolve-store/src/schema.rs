@@ -2,7 +2,7 @@ use crate::error::StoreError;
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
 use serde::Deserialize;
 
-pub(crate) const SCHEMA_VERSION: i64 = 3;
+pub(crate) const SCHEMA_VERSION: i64 = 4;
 
 pub(crate) fn initialize(connection: &mut Connection) -> Result<(), StoreError> {
     let has_metadata: bool = connection.query_row(
@@ -32,8 +32,13 @@ pub(crate) fn initialize(connection: &mut Connection) -> Result<(), StoreError> 
         1 => {
             migrate_v1_to_v2(connection)?;
             migrate_v2_to_v3(connection)?;
+            migrate_v3_to_v4(connection)?;
         }
-        2 => migrate_v2_to_v3(connection)?,
+        2 => {
+            migrate_v2_to_v3(connection)?;
+            migrate_v3_to_v4(connection)?;
+        }
+        3 => migrate_v3_to_v4(connection)?,
         SCHEMA_VERSION => {
             let transaction =
                 connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -192,6 +197,26 @@ fn migrate_v2_to_v3(connection: &mut Connection) -> Result<(), StoreError> {
     if transaction.changes() != 1 {
         return Err(StoreError::InvalidPersistedData(
             "schema version changed while migrating from v2".to_owned(),
+        ));
+    }
+    transaction.commit()?;
+    Ok(())
+}
+
+fn migrate_v3_to_v4(connection: &mut Connection) -> Result<(), StoreError> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    transaction.execute(
+        "ALTER TABLE commitments ADD COLUMN replacement_terminal_id TEXT
+         REFERENCES commitments(commitment_id)",
+        [],
+    )?;
+    transaction.execute(
+        "UPDATE metadata SET value = '4' WHERE key = 'schema_version' AND value = '3'",
+        [],
+    )?;
+    if transaction.changes() != 1 {
+        return Err(StoreError::InvalidPersistedData(
+            "schema version changed while migrating from v3".to_owned(),
         ));
     }
     transaction.commit()?;
@@ -415,4 +440,40 @@ fn create_fencing_tables(connection: &Connection) -> rusqlite::Result<()> {
             ON scope_locks(guard_id);
         ",
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rusqlite::Connection;
+
+    #[test]
+    fn schema_v3_migrates_to_v4_with_nullable_replacement_terminal() {
+        let mut connection = Connection::open_in_memory().expect("connection opens");
+        create_schema_v1(&connection).expect("v1 schema creates");
+        migrate_v1_to_v2(&mut connection).expect("v1 migrates");
+        migrate_v2_to_v3(&mut connection).expect("v2 migrates");
+        migrate_v3_to_v4(&mut connection).expect("v3 migrates");
+        let version: String = connection
+            .query_row(
+                "SELECT value FROM metadata WHERE key = 'schema_version'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("version reads");
+        assert_eq!(version, "4");
+        let replacement_column: Option<String> = connection
+            .query_row(
+                "SELECT name FROM pragma_table_info('commitments')
+                 WHERE name = 'replacement_terminal_id'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .expect("column lookup succeeds");
+        assert_eq!(
+            replacement_column.as_deref(),
+            Some("replacement_terminal_id")
+        );
+    }
 }

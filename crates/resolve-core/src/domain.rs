@@ -741,6 +741,7 @@ pub enum WorkEvent {
     },
     StructuralProposalApplied {
         target: CommitmentId,
+        change: StructuralChange,
     },
     AttentionRaised {
         attention_id: AttentionId,
@@ -748,6 +749,21 @@ pub enum WorkEvent {
     },
     AttentionCleared {
         attention_id: AttentionId,
+    },
+}
+
+/// Typed immutable evidence for an accepted structural mutation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum StructuralChange {
+    Decomposed {
+        children: Vec<CommitmentId>,
+        replacement_terminal_id: CommitmentId,
+    },
+    PrerequisiteAdded {
+        prerequisite: Prerequisite,
+    },
+    Abandoned {
+        rationale: String,
     },
 }
 

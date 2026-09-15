@@ -833,7 +833,7 @@ fn schema_v2_to_v3_backfills_claim_epoch_high_water() {
         r#"{"kind":"CommitmentClaimed","data":{"commitment_id":"commitment-legacy","worker_id":"worker-legacy","epoch":4}}"#,
     );
     let store = SqliteStore::open(&path).expect("v2 migrates and starts");
-    assert_eq!(store.schema_version().expect("schema version reads"), 3);
+    assert_eq!(store.schema_version().expect("schema version reads"), 4);
     assert_eq!(
         store
             .load_commitment_record(&commitment_id("commitment-legacy"))
