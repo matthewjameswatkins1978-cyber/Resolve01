@@ -40,6 +40,9 @@ Admission requires the guard to be issued, unexpired, current-boot, and still
 backed by every exact reserved scope row. Resolve may reserve scope while the
 commitment is `CLAIMED`, but consequential Tethers admission requires the
 commitment to have explicitly entered `WORKING`; admission does not start it.
+If the worker claim later expires or the process restarts, an admitted guard is
+reconstructed only with its commitment in `RECOVERY_PENDING`; its held locks
+remain fenced for the outcome path.
 It promotes all reservations to `Held`, records the typed action reference on
 the commitment, and appends `GuardAdmitted` atomically. Repeating the same
 admission is idempotent; a different action or scope set is rejected. Explicit

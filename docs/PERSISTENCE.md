@@ -91,9 +91,19 @@ an absolute worker-supplied deadline is not part of the API. Admission promotes
 reservations and records the commitment's outstanding action in the same
 transaction as `GuardAdmitted`, and only a `WORKING` commitment can be
 admitted. Heartbeats advance persisted monotonic time only forwards. Expiry
-moves claimed work to `RECOVERY_PENDING` and invalidates issued reservations.
-Held locks are not released by worker lease expiry. Safe outcomes release held
-locks atomically; `UNCERTAIN` deliberately retains the action and locks.
+moves every claim-bearing commitment state (`CLAIMED`, `WORKING`, ordinary
+`WAITING`, or `COMPLETION_PROPOSED`) to `RECOVERY_PENDING` and invalidates
+issued reservations. The persisted heartbeat is authoritative for each
+heartbeat lease calculation; a heartbeat at or after its derived deadline is
+rejected and cannot resurrect the claim. Held locks are not released by worker
+lease expiry. Safe outcomes release held locks atomically; `UNCERTAIN`
+deliberately retains the action and locks.
+
+The domain restoration and startup paths use one additional invariant: when an
+active claim exists, its epoch must equal the commitment's durable
+`last_claim_epoch` exactly. On restart, all claim-bearing states must have a
+claim before recovery processing, and no active claim may remain after old
+claims have been moved to `RECOVERY_PENDING`; inconsistent rows fail closed.
 
 ## Read projections and restoration boundary
 

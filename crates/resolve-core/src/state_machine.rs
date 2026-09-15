@@ -39,6 +39,10 @@ pub(crate) fn validate_transition(
         | (CommitmentState::CompletionProposed, CommitmentState::Completed)
         | (CommitmentState::CompletionProposed, CommitmentState::Cancelled)
         | (CommitmentState::CompletionProposed, CommitmentState::Abandoned) => true,
+        (CommitmentState::Waiting(reason), CommitmentState::RecoveryPending) => {
+            !reason.is_uncertain_action()
+        }
+        (CommitmentState::CompletionProposed, CommitmentState::RecoveryPending) => true,
         (CommitmentState::Completed, _)
         | (CommitmentState::Cancelled, _)
         | (CommitmentState::Abandoned, _) => false,
