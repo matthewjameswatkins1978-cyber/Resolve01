@@ -47,6 +47,17 @@ the pre-admission fence. Consequential Tethers admission requires the
 commitment to have explicitly entered `WORKING`; admission does not perform the
 `CLAIMED -> WORKING` transition.
 
+S5 structural planning does not add a state. A claim-fenced target may receive
+one of the three closed structural proposals: decomposition moves a working
+parent to `WAITING(Prerequisite(replacement_terminal))`, adding a prerequisite
+leaves the current state unchanged, and abandonment uses the existing terminal
+`ABANDONED` state. Decomposition children start as `PROPOSED` direct children
+of the same goal. When the replacement terminal becomes `COMPLETED`, the
+private store barrier cascade may complete the waiting parent and then any
+composite ancestors in deterministic, bounded order; this is not a public
+generic `WAITING -> COMPLETED` transition. Unfinished composite barriers block
+`recover_without_action` rather than being released to `READY`.
+
 `UNCERTAIN` is represented as
 `WAITING(UncertainAction(action_ref))`, retains the outstanding action and held
 scope locks, and cannot be resumed through the ordinary `resume` API. A safe

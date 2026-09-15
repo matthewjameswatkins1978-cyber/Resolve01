@@ -1,15 +1,17 @@
 use crate::error::StoreError;
 use crate::schema;
+use resolve_core::planning::{validate_acyclic, validate_proposal_shape};
 use resolve_core::{
     AcceptanceRef, AttentionId, AttentionItem, AttentionState, BootGeneration, ClaimEpoch,
-    ClaimLease, Commitment, CommitmentId, CommitmentState, ExecutionGuard, GoalId, GoalSpec,
-    GoalState, GuardId, GuardState, HumanDecisionRef, MonotonicDuration, MonotonicInstant,
-    Prerequisite, ScopeKey, ScopeSet, TethersActionRef, TethersContractRef, TethersOutcome,
-    WaitingReason, WorkEvent, WorkerId,
+    ClaimLease, Commitment, CommitmentId, CommitmentState, DomainError, ExecutionGuard, GoalId,
+    GoalSpec, GoalState, GuardId, GuardState, HumanDecisionRef, MonotonicDuration,
+    MonotonicInstant, NewCommitment, Prerequisite, ScopeKey, ScopeSet, StructuralChange,
+    StructuralProposal, TethersActionRef, TethersContractRef, TethersOutcome, WaitingReason,
+    WorkEvent, WorkerId,
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
 use std::time::Duration;
 
@@ -91,6 +93,7 @@ pub struct CommitmentRecord {
     claim: Option<ClaimRecord>,
     last_claim_epoch: Option<u64>,
     outstanding_action: Option<TethersActionRef>,
+    replacement_terminal_id: Option<CommitmentId>,
     state_version: i64,
 }
 
@@ -133,6 +136,10 @@ impl CommitmentRecord {
 
     pub fn outstanding_action(&self) -> Option<&TethersActionRef> {
         self.outstanding_action.as_ref()
+    }
+
+    pub fn replacement_terminal_id(&self) -> Option<&CommitmentId> {
+        self.replacement_terminal_id.as_ref()
     }
 
     pub fn state_version(&self) -> i64 {
@@ -495,29 +502,12 @@ impl SqliteStore {
         created_at: i64,
     ) -> Result<i64, StoreError> {
         validate_commitment_event(event, commitment.commitment_id(), "commitment creation")?;
-        let state_json = encode_commitment_state(commitment.state())?;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let boot_generation = current_boot_generation(&transaction)?;
         let event_id = append_event(&transaction, commitment.goal_id(), event, created_at)?;
-        transaction.execute(
-            "INSERT INTO commitments
-                (commitment_id, goal_id, parent_id, description, state_json,
-                 last_claim_epoch, outstanding_action, state_version)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            params![
-                commitment.commitment_id().as_ref(),
-                commitment.goal_id().as_ref(),
-                commitment.parent_id().map(AsRef::as_ref),
-                commitment.description(),
-                state_json,
-                commitment.last_claim_epoch().map(|epoch| epoch.value()),
-                commitment.outstanding_action().map(AsRef::as_ref),
-                INITIAL_STATE_VERSION,
-            ],
-        )?;
-        sync_commitment_children(&transaction, commitment, boot_generation)?;
+        insert_commitment_snapshot(&transaction, commitment, boot_generation)?;
         transaction.commit()?;
         Ok(event_id)
     }
@@ -580,6 +570,122 @@ impl SqliteStore {
             ],
         )?;
         sync_commitment_children(&transaction, commitment, boot_generation)?;
+        if matches!(commitment.state(), CommitmentState::Completed) {
+            complete_composite_barrier_cascade(
+                &transaction,
+                commitment.commitment_id(),
+                created_at,
+            )?;
+        }
+        transaction.commit()?;
+        Ok(event_id)
+    }
+
+    /// Apply one closed, claim-fenced structural proposal atomically.
+    pub fn apply_structural_proposal(
+        &mut self,
+        proposal: StructuralProposal,
+        worker_id: &WorkerId,
+        boot_generation: BootGeneration,
+        now: MonotonicInstant,
+        created_at: i64,
+    ) -> Result<i64, StoreError> {
+        validate_proposal_shape(&proposal)?;
+        let (target, epoch) = match &proposal {
+            StructuralProposal::Decompose { target, epoch, .. }
+            | StructuralProposal::AddPrerequisite { target, epoch, .. }
+            | StructuralProposal::Abandon { target, epoch, .. } => (target, *epoch),
+        };
+        let now_ticks = checked_i64(now.ticks(), "current monotonic instant")?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current_boot = current_boot_generation(&transaction)?;
+        if boot_generation != current_boot {
+            return Err(StoreError::ClaimMismatch {
+                commitment_id: target.to_string(),
+                reason: "proposal is not from the current boot generation".to_owned(),
+            });
+        }
+        let context = query_structural_target(&transaction, target)?;
+        let state = decode_commitment_state(&context.state_json)?;
+        if state.is_terminal() {
+            return Err(DomainError::TerminalCommitmentImmutable { state }.into());
+        }
+        if matches!(state, CommitmentState::RecoveryPending)
+            || matches!(
+                state,
+                CommitmentState::Waiting(WaitingReason::UncertainAction(_))
+            )
+        {
+            return Err(DomainError::InvalidStructuralProposal {
+                reason: "structural mutation is not valid during recovery or uncertainty",
+            }
+            .into());
+        }
+        if !state.requires_active_claim() {
+            return Err(StoreError::ClaimMismatch {
+                commitment_id: target.to_string(),
+                reason: format!("structural mutation is not valid in {state:?}"),
+            });
+        }
+        if let Some(action_ref) = context.outstanding_action {
+            return Err(StoreError::OutstandingAction {
+                commitment_id: target.to_string(),
+                action_ref,
+            });
+        }
+        let stored_epoch = context
+            .claim_epoch
+            .ok_or_else(|| StoreError::ClaimMismatch {
+                commitment_id: target.to_string(),
+                reason: "commitment has no current claim".to_owned(),
+            })?;
+        let epoch_ticks = checked_i64(epoch.value(), "claim epoch")?;
+        if stored_epoch != epoch_ticks || context.last_claim_epoch != Some(stored_epoch) {
+            return Err(StoreError::ClaimMismatch {
+                commitment_id: target.to_string(),
+                reason: "proposal epoch is not the current durable claim epoch".to_owned(),
+            });
+        }
+        let current_boot_ticks = checked_i64(current_boot.value(), "boot generation")?;
+        if context.worker_id.as_deref() != Some(worker_id.as_ref())
+            || context.claim_boot_generation != Some(current_boot_ticks)
+        {
+            return Err(StoreError::ClaimMismatch {
+                commitment_id: target.to_string(),
+                reason: "proposal worker or claim boot generation does not match".to_owned(),
+            });
+        }
+        expire_target_reservations(&transaction, target, now_ticks)?;
+        if query_active_guard(&transaction, target)? {
+            return Err(StoreError::GuardInvalid {
+                guard_id: target.to_string(),
+                reason: "structural mutation requires no live or admitted guard".to_owned(),
+            });
+        }
+        let graph = load_dependency_graph(&transaction)?;
+        let event_id = match proposal {
+            StructuralProposal::Decompose {
+                children,
+                replacement_terminal_id,
+                ..
+            } => apply_decomposition(
+                &transaction,
+                graph,
+                &context,
+                children,
+                replacement_terminal_id,
+                current_boot,
+                created_at,
+            )?,
+            StructuralProposal::AddPrerequisite { prerequisite, .. } => {
+                apply_add_prerequisite(&transaction, graph, &context, prerequisite, created_at)?
+            }
+            StructuralProposal::Abandon { rationale, .. } => {
+                apply_abandon(&transaction, &context, rationale, created_at)?
+            }
+        };
         transaction.commit()?;
         Ok(event_id)
     }
@@ -1424,17 +1530,27 @@ impl SqliteStore {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let (goal_id, state_json, outstanding_action, version): (
+        let (goal_id, state_json, outstanding_action, replacement_terminal_id, version): (
             String,
             String,
+            Option<String>,
             Option<String>,
             i64,
         ) = transaction
             .query_row(
-                "SELECT goal_id, state_json, outstanding_action, state_version
+                "SELECT goal_id, state_json, outstanding_action,
+                        replacement_terminal_id, state_version
                  FROM commitments WHERE commitment_id = ?1",
                 params![commitment_id.as_ref()],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
             )
             .optional()?
             .ok_or_else(|| not_found("commitment", commitment_id.to_string()))?;
@@ -1460,6 +1576,37 @@ impl SqliteStore {
                 reason: "recovery requires RECOVERY_PENDING with no claim, action, or held lock"
                     .to_owned(),
             });
+        }
+        if let Some(replacement_terminal_id) = replacement_terminal_id {
+            let replacement_state: String = transaction
+                .query_row(
+                    "SELECT state_json FROM commitments WHERE commitment_id = ?1",
+                    params![replacement_terminal_id.as_str()],
+                    |row| row.get(0),
+                )
+                .optional()?
+                .ok_or_else(|| {
+                    StoreError::InvalidPersistedData(
+                        "replacement terminal commitment is missing".to_owned(),
+                    )
+                })?;
+            if !matches!(
+                decode_commitment_state(&replacement_state)?,
+                CommitmentState::Completed
+            ) {
+                return Err(StoreError::RecoveryBlocked {
+                    commitment_id: commitment_id.to_string(),
+                    reason: "composite barrier is incomplete".to_owned(),
+                });
+            }
+            let replacement_terminal_id = parse_id(
+                replacement_terminal_id,
+                "replacement terminal",
+                CommitmentId::try_new,
+            )?;
+            complete_composite_barrier_cascade(&transaction, &replacement_terminal_id, created_at)?;
+            transaction.commit()?;
+            return Ok(());
         }
         let next_version = next_state_version(version)?;
         let ready = encode_commitment_state(&CommitmentState::Ready)?;
@@ -2085,7 +2232,8 @@ impl SqliteStore {
             .connection
             .query_row(
                 "SELECT commitment_id, goal_id, parent_id, description, state_json,
-                        last_claim_epoch, outstanding_action, state_version
+                        last_claim_epoch, outstanding_action, replacement_terminal_id,
+                        state_version
                  FROM commitments WHERE commitment_id = ?1",
                 params![commitment_id.as_ref()],
                 |row| {
@@ -2097,7 +2245,8 @@ impl SqliteStore {
                         row.get::<_, String>(4)?,
                         row.get::<_, Option<i64>>(5)?,
                         row.get::<_, Option<String>>(6)?,
-                        row.get::<_, i64>(7)?,
+                        row.get::<_, Option<String>>(7)?,
+                        row.get::<_, i64>(8)?,
                     ))
                 },
             )
@@ -2111,6 +2260,7 @@ impl SqliteStore {
             state_json,
             last_claim_epoch,
             outstanding_action,
+            replacement_terminal_id,
             version,
         ) = row;
         let claim = self
@@ -2167,21 +2317,48 @@ impl SqliteStore {
                 "outstanding action disagrees with commitment state".to_owned(),
             ));
         }
+        let commitment_id = parse_id(stored_id, "commitment", CommitmentId::try_new)?;
+        let goal_id = parse_id(goal_id, "goal", GoalId::try_new)?;
+        let parent_id = parent_id
+            .map(|value| parse_id(value, "parent commitment", CommitmentId::try_new))
+            .transpose()?;
+        let replacement_terminal_id = replacement_terminal_id
+            .map(|value| parse_id(value, "replacement terminal", CommitmentId::try_new))
+            .transpose()?;
+        if let Some(replacement_terminal_id) = replacement_terminal_id.as_ref() {
+            let child = self
+                .connection
+                .query_row(
+                    "SELECT parent_id, goal_id FROM commitments WHERE commitment_id = ?1",
+                    params![replacement_terminal_id.as_ref()],
+                    |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, String>(1)?)),
+                )
+                .optional()?
+                .ok_or_else(|| {
+                    StoreError::InvalidPersistedData(
+                        "replacement terminal commitment is missing".to_owned(),
+                    )
+                })?;
+            if child.0.as_deref() != Some(commitment_id.as_ref()) || child.1 != goal_id.as_ref() {
+                return Err(StoreError::InvalidPersistedData(
+                    "replacement terminal is not a direct same-goal child".to_owned(),
+                ));
+            }
+        }
         Ok(CommitmentRecord {
-            commitment_id: parse_id(stored_id, "commitment", CommitmentId::try_new)?,
-            goal_id: parse_id(goal_id, "goal", GoalId::try_new)?,
-            parent_id: parent_id
-                .map(|value| parse_id(value, "parent commitment", CommitmentId::try_new))
-                .transpose()?,
+            commitment_id: commitment_id.clone(),
+            goal_id,
+            parent_id,
             description,
             state,
-            prerequisites: self.load_prerequisites(commitment_id)?,
-            acceptance_refs: self.load_acceptance_refs(commitment_id)?,
+            prerequisites: self.load_prerequisites(&commitment_id)?,
+            acceptance_refs: self.load_acceptance_refs(&commitment_id)?,
             claim,
             last_claim_epoch,
             outstanding_action: outstanding_action
                 .map(|value| parse_id(value, "Tethers action", TethersActionRef::try_new))
                 .transpose()?,
+            replacement_terminal_id,
             state_version: version,
         })
     }
@@ -2591,6 +2768,543 @@ fn sync_commitment_children(
             claim,
             boot_generation,
         )?;
+    }
+    Ok(())
+}
+
+fn insert_commitment_snapshot(
+    transaction: &Transaction<'_>,
+    commitment: &Commitment,
+    boot_generation: BootGeneration,
+) -> Result<(), StoreError> {
+    transaction.execute(
+        "INSERT INTO commitments
+            (commitment_id, goal_id, parent_id, description, state_json,
+             last_claim_epoch, outstanding_action, replacement_terminal_id,
+             state_version)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, ?8)",
+        params![
+            commitment.commitment_id().as_ref(),
+            commitment.goal_id().as_ref(),
+            commitment.parent_id().map(AsRef::as_ref),
+            commitment.description(),
+            encode_commitment_state(commitment.state())?,
+            commitment.last_claim_epoch().map(|epoch| epoch.value()),
+            commitment.outstanding_action().map(AsRef::as_ref),
+            INITIAL_STATE_VERSION,
+        ],
+    )?;
+    sync_commitment_children(transaction, commitment, boot_generation)
+}
+
+#[derive(Debug)]
+struct StructuralTargetContext {
+    commitment_id: CommitmentId,
+    goal_id: String,
+    state_json: String,
+    outstanding_action: Option<String>,
+    state_version: i64,
+    last_claim_epoch: Option<i64>,
+    worker_id: Option<String>,
+    claim_epoch: Option<i64>,
+    claim_boot_generation: Option<i64>,
+    replacement_terminal_id: Option<String>,
+}
+
+#[derive(Debug)]
+struct DependencyGraph {
+    edges: BTreeMap<CommitmentId, BTreeSet<CommitmentId>>,
+    prerequisites: BTreeMap<CommitmentId, Vec<Prerequisite>>,
+}
+
+fn query_structural_target(
+    transaction: &Transaction<'_>,
+    commitment_id: &CommitmentId,
+) -> Result<StructuralTargetContext, StoreError> {
+    transaction
+        .query_row(
+            "SELECT c.goal_id, c.state_json, c.outstanding_action, c.state_version,
+                    c.last_claim_epoch, c.replacement_terminal_id,
+                    cl.worker_id, cl.claim_epoch, cl.boot_generation
+             FROM commitments c
+             LEFT JOIN claims cl ON cl.commitment_id = c.commitment_id
+             WHERE c.commitment_id = ?1",
+            params![commitment_id.as_ref()],
+            |row| {
+                Ok(StructuralTargetContext {
+                    commitment_id: commitment_id.clone(),
+                    goal_id: row.get(0)?,
+                    state_json: row.get(1)?,
+                    outstanding_action: row.get(2)?,
+                    state_version: row.get(3)?,
+                    last_claim_epoch: row.get(4)?,
+                    replacement_terminal_id: row.get(5)?,
+                    worker_id: row.get(6)?,
+                    claim_epoch: row.get(7)?,
+                    claim_boot_generation: row.get(8)?,
+                })
+            },
+        )
+        .optional()?
+        .ok_or_else(|| not_found("commitment", commitment_id.to_string()))
+}
+
+fn query_active_guard(
+    transaction: &Transaction<'_>,
+    commitment_id: &CommitmentId,
+) -> Result<bool, StoreError> {
+    Ok(transaction.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM execution_guards
+            WHERE commitment_id = ?1 AND state IN ('issued', 'admitted', 'uncertain')
+        )",
+        params![commitment_id.as_ref()],
+        |row| row.get(0),
+    )?)
+}
+
+fn expire_target_reservations(
+    transaction: &Transaction<'_>,
+    commitment_id: &CommitmentId,
+    now_ticks: i64,
+) -> Result<(), StoreError> {
+    let mut statement = transaction.prepare(
+        "SELECT guard_id FROM execution_guards
+         WHERE commitment_id = ?1 AND state = 'issued'",
+    )?;
+    let mut rows = statement.query(params![commitment_id.as_ref()])?;
+    let mut guards = Vec::new();
+    while let Some(row) = rows.next()? {
+        guards.push(parse_id(row.get(0)?, "guard", GuardId::try_new)?);
+    }
+    drop(rows);
+    drop(statement);
+    for guard_id in guards {
+        let scopes = query_guard_scopes(transaction, &guard_id)?;
+        expire_relevant_reservations(transaction, scopes.as_slice(), now_ticks)?;
+    }
+    Ok(())
+}
+
+fn load_dependency_graph(transaction: &Transaction<'_>) -> Result<DependencyGraph, StoreError> {
+    let mut graph = DependencyGraph {
+        edges: BTreeMap::new(),
+        prerequisites: BTreeMap::new(),
+    };
+    let mut statement = transaction.prepare(
+        "SELECT commitment_id, goal_id, parent_id
+         FROM commitments ORDER BY commitment_id",
+    )?;
+    let mut rows = statement.query([])?;
+    let mut commitments = Vec::new();
+    while let Some(row) = rows.next()? {
+        commitments.push((
+            parse_id(row.get(0)?, "commitment", CommitmentId::try_new)?,
+            parse_id(row.get(1)?, "goal", GoalId::try_new)?,
+            row.get::<_, Option<String>>(2)?,
+        ));
+    }
+    drop(rows);
+    drop(statement);
+    let known: BTreeSet<_> = commitments.iter().map(|(id, _, _)| id.clone()).collect();
+    for (id, _goal, parent) in commitments {
+        let _parent = parent
+            .map(|value| parse_id(value, "parent commitment", CommitmentId::try_new))
+            .transpose()?;
+        let prerequisites = query_prerequisites_transaction(transaction, &id)?;
+        let mut edges = BTreeSet::new();
+        for prerequisite in &prerequisites {
+            if let Prerequisite::Commitment(dependency) = prerequisite {
+                if !known.contains(dependency) {
+                    return Err(StoreError::InvalidPersistedData(format!(
+                        "commitment {id} has a missing prerequisite {dependency}"
+                    )));
+                }
+                edges.insert(dependency.clone());
+            }
+        }
+        graph.edges.insert(id.clone(), edges);
+        graph.prerequisites.insert(id, prerequisites);
+    }
+    validate_acyclic(&graph.edges)?;
+    Ok(graph)
+}
+
+fn query_prerequisites_transaction(
+    transaction: &Transaction<'_>,
+    commitment_id: &CommitmentId,
+) -> Result<Vec<Prerequisite>, StoreError> {
+    let mut statement = transaction.prepare(
+        "SELECT prerequisite_type, reference_id, prerequisite_commitment_id
+         FROM commitment_prerequisites
+         WHERE commitment_id = ?1 ORDER BY ordinal",
+    )?;
+    let mut rows = statement.query(params![commitment_id.as_ref()])?;
+    let mut prerequisites = Vec::new();
+    while let Some(row) = rows.next()? {
+        prerequisites.push(decode_prerequisite(row.get(0)?, row.get(1)?, row.get(2)?)?);
+    }
+    Ok(prerequisites)
+}
+
+fn apply_decomposition(
+    transaction: &Transaction<'_>,
+    graph: DependencyGraph,
+    context: &StructuralTargetContext,
+    children: Vec<NewCommitment>,
+    replacement_terminal_id: CommitmentId,
+    boot_generation: BootGeneration,
+    created_at: i64,
+) -> Result<i64, StoreError> {
+    let target = context.commitment_id.clone();
+    if context.replacement_terminal_id.is_some() {
+        return Err(DomainError::InvalidStructuralProposal {
+            reason: "commitment has already been decomposed",
+        }
+        .into());
+    }
+    let target_goal = parse_id(context.goal_id.clone(), "goal", GoalId::try_new)?;
+    let proposed_ids: BTreeSet<_> = children
+        .iter()
+        .map(|child| child.commitment_id().clone())
+        .collect();
+    if proposed_ids
+        .iter()
+        .any(|id| graph.edges.contains_key(id) || id == &target)
+    {
+        return Err(DomainError::InvalidStructuralProposal {
+            reason: "decomposition child ID already exists",
+        }
+        .into());
+    }
+    let mut candidate = graph.edges.clone();
+    for child in &children {
+        let mut dependencies = BTreeSet::new();
+        for prerequisite in child.prerequisites() {
+            if let Prerequisite::Commitment(dependency) = prerequisite {
+                if !graph.edges.contains_key(dependency) && !proposed_ids.contains(dependency) {
+                    return Err(DomainError::InvalidStructuralProposal {
+                        reason: "child prerequisite does not identify an existing or proposed commitment",
+                    }
+                    .into());
+                }
+                dependencies.insert(dependency.clone());
+            }
+        }
+        candidate.insert(child.commitment_id().clone(), dependencies);
+    }
+    candidate
+        .entry(target.clone())
+        .or_default()
+        .insert(replacement_terminal_id.clone());
+    validate_acyclic(&candidate)?;
+
+    for child in &children {
+        let commitment = Commitment::new(
+            child.commitment_id().clone(),
+            target_goal.clone(),
+            Some(target.clone()),
+            child.description(),
+            child.prerequisites().to_vec(),
+            child.acceptance_refs().to_vec(),
+        )?;
+        append_event(
+            transaction,
+            &target_goal,
+            &WorkEvent::CommitmentCreated {
+                commitment_id: commitment.commitment_id().clone(),
+                goal_id: target_goal.clone(),
+            },
+            created_at,
+        )?;
+        insert_commitment_snapshot(transaction, &commitment, boot_generation)?;
+    }
+
+    let current_prerequisites = graph.prerequisites.get(&target).ok_or_else(|| {
+        StoreError::InvalidPersistedData("target prerequisites are missing".to_owned())
+    })?;
+    transaction.execute(
+        "INSERT INTO commitment_prerequisites
+            (commitment_id, ordinal, prerequisite_type, reference_id,
+             prerequisite_commitment_id)
+         VALUES (?1, ?2, 'commitment', ?3, ?3)",
+        params![
+            target.as_ref(),
+            current_prerequisites.len() as i64,
+            replacement_terminal_id.as_ref()
+        ],
+    )?;
+    let waiting =
+        CommitmentState::Waiting(WaitingReason::Prerequisite(replacement_terminal_id.clone()));
+    let next_version = next_state_version(context.state_version)?;
+    transaction.execute(
+        "UPDATE commitments
+         SET state_json = ?1, replacement_terminal_id = ?2, state_version = ?3
+         WHERE commitment_id = ?4 AND state_version = ?5 AND outstanding_action IS NULL",
+        params![
+            encode_commitment_state(&waiting)?,
+            replacement_terminal_id.as_ref(),
+            next_version,
+            target.as_ref(),
+            context.state_version
+        ],
+    )?;
+    append_event(
+        transaction,
+        &target_goal,
+        &WorkEvent::CommitmentWaiting {
+            commitment_id: target.clone(),
+            reason: WaitingReason::Prerequisite(replacement_terminal_id.clone()),
+        },
+        created_at,
+    )?;
+    let event_id = append_event(
+        transaction,
+        &target_goal,
+        &WorkEvent::StructuralProposalApplied {
+            target,
+            change: StructuralChange::Decomposed {
+                children: children
+                    .iter()
+                    .map(|child| child.commitment_id().clone())
+                    .collect(),
+                replacement_terminal_id,
+            },
+        },
+        created_at,
+    )?;
+    Ok(event_id)
+}
+
+fn apply_add_prerequisite(
+    transaction: &Transaction<'_>,
+    graph: DependencyGraph,
+    context: &StructuralTargetContext,
+    prerequisite: Prerequisite,
+    created_at: i64,
+) -> Result<i64, StoreError> {
+    let target = context.commitment_id.clone();
+    let current = graph.prerequisites.get(&target).ok_or_else(|| {
+        StoreError::InvalidPersistedData("target prerequisites are missing".to_owned())
+    })?;
+    if current.contains(&prerequisite) {
+        return Err(DomainError::InvalidStructuralProposal {
+            reason: "prerequisite is already present",
+        }
+        .into());
+    }
+    let mut candidate = graph.edges.clone();
+    if let Prerequisite::Commitment(dependency) = &prerequisite {
+        if !candidate.contains_key(dependency) {
+            return Err(DomainError::InvalidStructuralProposal {
+                reason: "commitment prerequisite does not exist",
+            }
+            .into());
+        }
+        candidate
+            .entry(target.clone())
+            .or_default()
+            .insert(dependency.clone());
+    }
+    validate_acyclic(&candidate)?;
+    let goal_id = parse_id(context.goal_id.clone(), "goal", GoalId::try_new)?;
+    let (kind, reference_id, prerequisite_commitment_id) = prerequisite_columns(&prerequisite);
+    transaction.execute(
+        "INSERT INTO commitment_prerequisites
+            (commitment_id, ordinal, prerequisite_type, reference_id,
+             prerequisite_commitment_id)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![
+            target.as_ref(),
+            current.len() as i64,
+            kind,
+            reference_id,
+            prerequisite_commitment_id
+        ],
+    )?;
+    let next_version = next_state_version(context.state_version)?;
+    transaction.execute(
+        "UPDATE commitments SET state_version = ?1
+         WHERE commitment_id = ?2 AND state_version = ?3 AND outstanding_action IS NULL",
+        params![next_version, target.as_ref(), context.state_version],
+    )?;
+    append_event(
+        transaction,
+        &goal_id,
+        &WorkEvent::StructuralProposalApplied {
+            target,
+            change: StructuralChange::PrerequisiteAdded { prerequisite },
+        },
+        created_at,
+    )
+}
+
+fn apply_abandon(
+    transaction: &Transaction<'_>,
+    context: &StructuralTargetContext,
+    rationale: String,
+    created_at: i64,
+) -> Result<i64, StoreError> {
+    let target = context.commitment_id.clone();
+    let goal_id = parse_id(context.goal_id.clone(), "goal", GoalId::try_new)?;
+    let next_version = next_state_version(context.state_version)?;
+    transaction.execute(
+        "UPDATE commitments SET state_json = ?1, state_version = ?2
+         WHERE commitment_id = ?3 AND state_version = ?4 AND outstanding_action IS NULL",
+        params![
+            encode_commitment_state(&CommitmentState::Abandoned)?,
+            next_version,
+            target.as_ref(),
+            context.state_version
+        ],
+    )?;
+    transaction.execute(
+        "DELETE FROM claims WHERE commitment_id = ?1",
+        params![target.as_ref()],
+    )?;
+    append_event(
+        transaction,
+        &goal_id,
+        &WorkEvent::CommitmentAbandoned {
+            commitment_id: target.clone(),
+        },
+        created_at,
+    )?;
+    append_event(
+        transaction,
+        &goal_id,
+        &WorkEvent::StructuralProposalApplied {
+            target,
+            change: StructuralChange::Abandoned { rationale },
+        },
+        created_at,
+    )
+}
+
+fn prerequisite_columns(prerequisite: &Prerequisite) -> (&'static str, &str, Option<&str>) {
+    match prerequisite {
+        Prerequisite::Commitment(id) => ("commitment", id.as_ref(), Some(id.as_ref())),
+        Prerequisite::TethersVerification(reference) => {
+            ("tethers_verification", reference.as_ref(), None)
+        }
+        Prerequisite::HumanDecision(reference) => ("human_decision", reference.as_ref(), None),
+    }
+}
+
+fn complete_composite_barrier_cascade(
+    transaction: &Transaction<'_>,
+    completed_id: &CommitmentId,
+    created_at: i64,
+) -> Result<(), StoreError> {
+    let total: i64 =
+        transaction.query_row("SELECT COUNT(*) FROM commitments", [], |row| row.get(0))?;
+    let mut pending = vec![completed_id.clone()];
+    let mut processed = 0_i64;
+    while let Some(child_id) = pending.pop() {
+        let mut statement = transaction.prepare(
+            "SELECT commitment_id, goal_id, state_json, state_version,
+                    outstanding_action
+             FROM commitments WHERE replacement_terminal_id = ?1
+             ORDER BY commitment_id",
+        )?;
+        let mut rows = statement.query(params![child_id.as_ref()])?;
+        let mut parents = Vec::new();
+        while let Some(row) = rows.next()? {
+            parents.push((
+                parse_id(row.get(0)?, "parent commitment", CommitmentId::try_new)?,
+                parse_id(row.get(1)?, "goal", GoalId::try_new)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, Option<String>>(4)?,
+            ));
+        }
+        drop(rows);
+        drop(statement);
+        for (parent_id, goal_id, state_json, version, outstanding_action) in parents {
+            processed = processed.checked_add(1).ok_or_else(|| {
+                StoreError::InvalidMutation("composite barrier cascade count overflowed".to_owned())
+            })?;
+            if processed > total {
+                return Err(StoreError::InvalidPersistedData(
+                    "composite barrier cascade exceeded commitment count".to_owned(),
+                ));
+            }
+            let child_parent: Option<String> = transaction.query_row(
+                "SELECT parent_id FROM commitments WHERE commitment_id = ?1",
+                params![child_id.as_ref()],
+                |row| row.get(0),
+            )?;
+            let child_goal: String = transaction.query_row(
+                "SELECT goal_id FROM commitments WHERE commitment_id = ?1",
+                params![child_id.as_ref()],
+                |row| row.get(0),
+            )?;
+            if child_parent.as_deref() != Some(parent_id.as_ref()) || child_goal != goal_id.as_ref()
+            {
+                return Err(StoreError::InvalidPersistedData(
+                    "composite barrier child is not a direct same-goal child".to_owned(),
+                ));
+            }
+            if outstanding_action.is_some() {
+                return Err(StoreError::RecoveryBlocked {
+                    commitment_id: parent_id.to_string(),
+                    reason: "composite barrier parent has an outstanding action".to_owned(),
+                });
+            }
+            let state = decode_commitment_state(&state_json)?;
+            let is_waiting_on_child = matches!(
+                &state,
+                CommitmentState::Waiting(WaitingReason::Prerequisite(prerequisite))
+                    if prerequisite == &child_id
+            );
+            let is_recovery_pending = matches!(state, CommitmentState::RecoveryPending);
+            if !is_waiting_on_child && !is_recovery_pending {
+                if matches!(state, CommitmentState::Completed) {
+                    continue;
+                }
+                return Err(StoreError::InvalidPersistedData(
+                    "composite barrier parent is not waiting on its replacement terminal"
+                        .to_owned(),
+                ));
+            }
+            let held_locks: i64 = transaction.query_row(
+                "SELECT COUNT(*) FROM scope_locks
+                 WHERE commitment_id = ?1 AND lock_state = 'held'",
+                params![parent_id.as_ref()],
+                |row| row.get(0),
+            )?;
+            if held_locks != 0 {
+                return Err(StoreError::RecoveryBlocked {
+                    commitment_id: parent_id.to_string(),
+                    reason: "composite barrier parent still owns a held lock".to_owned(),
+                });
+            }
+            let next_version = next_state_version(version)?;
+            transaction.execute(
+                "UPDATE commitments SET state_json = ?1, state_version = ?2
+                 WHERE commitment_id = ?3 AND state_version = ?4
+                   AND outstanding_action IS NULL",
+                params![
+                    encode_commitment_state(&CommitmentState::Completed)?,
+                    next_version,
+                    parent_id.as_ref(),
+                    version
+                ],
+            )?;
+            transaction.execute(
+                "DELETE FROM claims WHERE commitment_id = ?1",
+                params![parent_id.as_ref()],
+            )?;
+            append_event(
+                transaction,
+                &goal_id,
+                &WorkEvent::CommitmentCompleted {
+                    commitment_id: parent_id.clone(),
+                },
+                created_at,
+            )?;
+            pending.push(parent_id);
+        }
     }
     Ok(())
 }
@@ -3020,6 +3734,7 @@ enum StoredEventPayload {
     },
     StructuralProposalApplied {
         target: String,
+        change: StoredStructuralChange,
     },
     AttentionRaised {
         attention_id: String,
@@ -3036,6 +3751,29 @@ enum StoredTethersOutcome {
     Succeeded(String),
     Failed(String),
     Uncertain(String),
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(tag = "kind", content = "data")]
+enum StoredStructuralChange {
+    Decomposed {
+        children: Vec<String>,
+        replacement_terminal_id: String,
+    },
+    PrerequisiteAdded {
+        prerequisite: StoredPrerequisite,
+    },
+    Abandoned {
+        rationale: String,
+    },
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(tag = "kind", content = "value")]
+enum StoredPrerequisite {
+    Commitment(String),
+    TethersVerification(String),
+    HumanDecision(String),
 }
 
 fn decode_guard_state(
@@ -3143,6 +3881,39 @@ fn encode_stored_outcome(outcome: &TethersOutcome) -> StoredTethersOutcome {
         TethersOutcome::Uncertain { action_ref } => {
             StoredTethersOutcome::Uncertain(action_ref.as_ref().to_owned())
         }
+    }
+}
+
+fn encode_structural_change(change: &StructuralChange) -> StoredStructuralChange {
+    match change {
+        StructuralChange::Decomposed {
+            children,
+            replacement_terminal_id,
+        } => StoredStructuralChange::Decomposed {
+            children: children
+                .iter()
+                .map(|child| child.as_ref().to_owned())
+                .collect(),
+            replacement_terminal_id: replacement_terminal_id.as_ref().to_owned(),
+        },
+        StructuralChange::PrerequisiteAdded { prerequisite } => {
+            StoredStructuralChange::PrerequisiteAdded {
+                prerequisite: match prerequisite {
+                    Prerequisite::Commitment(id) => {
+                        StoredPrerequisite::Commitment(id.as_ref().to_owned())
+                    }
+                    Prerequisite::TethersVerification(reference) => {
+                        StoredPrerequisite::TethersVerification(reference.as_ref().to_owned())
+                    }
+                    Prerequisite::HumanDecision(reference) => {
+                        StoredPrerequisite::HumanDecision(reference.as_ref().to_owned())
+                    }
+                },
+            }
+        }
+        StructuralChange::Abandoned { rationale } => StoredStructuralChange::Abandoned {
+            rationale: rationale.clone(),
+        },
     }
 }
 
@@ -3281,9 +4052,10 @@ fn encode_event_payload(event: &WorkEvent) -> StoredEventPayload {
         WorkEvent::RecoveryReleased { commitment_id } => StoredEventPayload::RecoveryReleased {
             commitment_id: commitment_id.as_ref().to_owned(),
         },
-        WorkEvent::StructuralProposalApplied { target } => {
+        WorkEvent::StructuralProposalApplied { target, change } => {
             StoredEventPayload::StructuralProposalApplied {
                 target: target.as_ref().to_owned(),
+                change: encode_structural_change(change),
             }
         }
         WorkEvent::AttentionRaised {
@@ -3352,7 +4124,7 @@ fn event_commitment_id(event: &WorkEvent) -> Option<&CommitmentId> {
         | WorkEvent::GuardInvalidated { .. }
         | WorkEvent::GuardReservationExpired { .. }
         | WorkEvent::TethersOutcomeRecorded { .. }
-        | WorkEvent::StructuralProposalApplied { .. }
         | WorkEvent::AttentionCleared { .. } => None,
+        WorkEvent::StructuralProposalApplied { target, .. } => Some(target),
     }
 }
