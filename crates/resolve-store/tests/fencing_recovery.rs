@@ -119,9 +119,6 @@ fn prepare_goal_store(store: &mut SqliteStore) {
             },
         )
         .expect("goal inserts");
-    store
-        .set_boot_generation(BootGeneration::from_raw(7))
-        .expect("boot generation sets");
 }
 
 fn prepare_claimed_store(store: &mut SqliteStore) {
@@ -183,13 +180,36 @@ fn issue(
     scopes: Vec<ScopeKey>,
     timing: Timing,
 ) -> Result<ExecutionGuard, StoreError> {
+    issue_at_boot(
+        store,
+        guard,
+        commitment,
+        epoch,
+        worker,
+        scopes,
+        timing,
+        BootGeneration::from_raw(0),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn issue_at_boot(
+    store: &mut SqliteStore,
+    guard: &str,
+    commitment: &str,
+    epoch: ClaimEpoch,
+    worker: &str,
+    scopes: Vec<ScopeKey>,
+    timing: Timing,
+    boot_generation: BootGeneration,
+) -> Result<ExecutionGuard, StoreError> {
     store.issue_guard(GuardIssueRequest {
         guard_id: guard_id(guard),
         commitment_id: commitment_id(commitment),
         worker_id: worker_id(worker),
         claim_epoch: epoch,
         scope_keys: scope_set(scopes),
-        boot_generation: BootGeneration::from_raw(7),
+        boot_generation,
         now: MonotonicInstant::from_ticks(timing.now),
         guard_ttl: MonotonicDuration::try_from_ticks(timing.ttl).expect("test duration is valid"),
         claim_lease_duration: MonotonicDuration::try_from_ticks(timing.claim_lease_duration)
@@ -384,22 +404,17 @@ fn expired_persisted_claim_cannot_issue_or_append() {
 
 #[test]
 fn persisted_lease_arithmetic_overflow_fails_closed() {
-    let directory = tempdir().expect("temporary directory creates");
-    let path = directory.path().join("overflow.sqlite");
-    let mut store = SqliteStore::open(&path).expect("store opens");
+    let mut store = SqliteStore::open_in_memory_for_tests().expect("store opens");
     prepare_claimed_store(&mut store);
-    drop(store);
-
-    let connection = Connection::open(&path).expect("database reopens");
-    connection
-        .execute(
-            "UPDATE claims SET last_heartbeat = ?1 WHERE commitment_id = ?2",
-            rusqlite::params![i64::MAX, "commitment-1"],
-        )
-        .expect("test heartbeat update succeeds");
-    drop(connection);
-
-    let mut store = SqliteStore::open(&path).expect("store reopens");
+    let mut overflow_store = SqliteStore::open_in_memory_for_tests().expect("store opens");
+    prepare_goal_store(&mut overflow_store);
+    add_claimed_commitment(
+        &mut overflow_store,
+        "commitment-1",
+        "worker-1",
+        i64::MAX as u64,
+    );
+    store = overflow_store;
     let event_count = store.list_events().expect("events load").len();
     let error = issue(
         &mut store,
@@ -498,7 +513,7 @@ fn issuance_canonicalizes_scopes_and_binds_guard_metadata() {
 
     assert_eq!(guard.scope_keys(), &[scope("a"), scope("z")]);
     assert_eq!(guard.claim_epoch(), ClaimEpoch::initial());
-    assert_eq!(guard.boot_generation(), BootGeneration::from_raw(7));
+    assert_eq!(guard.boot_generation(), BootGeneration::from_raw(0));
     assert_eq!(
         guard.reservation_expires_at(),
         MonotonicInstant::from_ticks(30)
@@ -701,10 +716,7 @@ fn stale_epoch_and_invalid_claim_requests_cannot_issue_or_mutate_guards() {
 #[test]
 fn claims_from_an_older_boot_generation_are_fenced() {
     let mut store = claimed_store();
-    store
-        .set_boot_generation(BootGeneration::from_raw(8))
-        .expect("boot generation advances");
-    let error = issue(
+    let error = issue_at_boot(
         &mut store,
         "guard-old-boot",
         "commitment-1",
@@ -716,6 +728,7 @@ fn claims_from_an_older_boot_generation_are_fenced() {
             ttl: 10,
             claim_lease_duration: 99,
         },
+        BootGeneration::from_raw(8),
     )
     .expect_err("old boot claim cannot issue a guard");
     assert!(matches!(error, StoreError::ClaimMismatch { .. }));
@@ -795,7 +808,7 @@ fn explicit_invalidation_releases_only_unadmitted_reservations() {
             &worker_id("worker-1"),
             ClaimEpoch::initial(),
             MonotonicInstant::from_ticks(15),
-            MonotonicInstant::from_ticks(100),
+            MonotonicDuration::try_from_ticks(99).expect("test duration is valid"),
         )
         .expect("current claimant can invalidate issued guard");
     assert_eq!(
@@ -865,7 +878,7 @@ fn migration_preserves_v1_data_and_reopen_is_idempotent() {
     drop(connection);
 
     let store = SqliteStore::open(&path).expect("v1 migrates");
-    assert_eq!(store.schema_version().expect("version reads"), 2);
+    assert_eq!(store.schema_version().expect("version reads"), 3);
     assert_eq!(
         store
             .load_goal_record(&GoalId::try_new("goal-legacy").expect("id is valid"))
@@ -880,7 +893,7 @@ fn migration_preserves_v1_data_and_reopen_is_idempotent() {
             .expect("reopen succeeds")
             .schema_version()
             .expect("version reads"),
-        2
+        3
     );
 }
 

@@ -18,12 +18,20 @@ authoritative outcome:
 SUCCEEDED | FAILED | UNCERTAIN
 ```
 
-Resolve records the outcome and updates its live coordination state. It does
-not execute the action, apply Tethers policy, or reinterpret `UNCERTAIN` as
-`FAILED`.
+Resolve records the outcome and updates its live coordination state in one
+transaction. `SUCCEEDED` and `FAILED` resolve the unique guard, clear the
+outstanding action, and release every held scope lock. `UNCERTAIN` resolves
+neither the action nor the locks: it marks the guard uncertain, retains the
+outstanding action, and moves the commitment to
+`WAITING(UncertainAction(action_ref))`. Resolve does not execute the action,
+apply Tethers policy, or reinterpret `UNCERTAIN` as `FAILED`.
 
-S3 has no Tethers integration or execution capability. Resolve may issue the
-guard and reserve its scopes while the commitment is `CLAIMED`, but the mock
-admission path requires the commitment to be explicitly `WORKING` before it
-records the opaque action reference and exact scope match. Admission does not
-start the commitment; policy and execution remain Tethers-owned.
+Resolve may issue the guard and reserve its scopes while the commitment is
+`CLAIMED`, but admission requires the commitment to be explicitly `WORKING`
+before it records the opaque action reference and exact scope match. Admission
+does not start the commitment; policy and execution remain Tethers-owned. On a
+real Resolve file-backed startup, active claims and issued reservations are
+invalidated, while admitted action/held-lock pairs are reconstructed only when
+their persisted relationship is internally consistent. Tethers must continue to
+provide at least one opaque authoritative scope key for every guarded
+consequential action.

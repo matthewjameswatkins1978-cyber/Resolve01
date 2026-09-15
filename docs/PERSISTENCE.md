@@ -26,8 +26,8 @@ file-backed databases for WAL tests.
 
 ## Schema ownership
 
-Schema version `2` is recorded in `metadata`. S3 migrates schema version 1 to
-2 transactionally without recreating or discarding S2 data. The store owns
+Schema version `3` is recorded in `metadata`. S4 migrates schema version 2 to
+3 transactionally without recreating or discarding earlier data. The store owns
 these tables:
 
 ```text
@@ -47,8 +47,11 @@ scope_locks
 
 `metadata.boot_generation` is explicit store context. Claims persist the boot
 generation under which they were recorded; guard issuance and admission reject
-claims or guards from another generation. Restart invalidation itself remains
-S4 work.
+claims or guards from another generation. Commitments also persist the
+monotonic claim-epoch high-water mark. The v2-to-v3 migration backfills that
+mark from every well-formed historical `CommitmentClaimed` event and current
+claim, and fails closed on malformed history. Non-null action references are
+unique across guards.
 
 Goals and commitments carry store-owned `state_version` values. Goal revision
 rows are append-only. Prerequisites and acceptance references are normalized
@@ -79,24 +82,28 @@ stale value returns `StoreError::VersionConflict` and never appends an event.
 The store never silently performs last-writer-wins updates and does not use a
 claim epoch as a substitute for the independent snapshot version.
 
-Guard issuance, reactive reservation expiry, and admission use one
-`BEGIN IMMEDIATE` transaction. Issuance treats the persisted claim
+Guard issuance, reactive reservation expiry, admission, heartbeat, claim
+expiry, restart recovery, and outcome handling use one `BEGIN IMMEDIATE`
+transaction. Issuance treats the persisted claim
 `last_heartbeat` as authoritative, adds only the trusted
 `claim_lease_duration`, and derives the claim deadline inside that transaction;
 an absolute worker-supplied deadline is not part of the API. Admission promotes
 reservations and records the commitment's outstanding action in the same
-transaction as `GuardAdmitted`.
-Held locks are not released by worker lease expiry. S3 contains no outcome,
-recovery, restart, or background-sweeper behavior.
+transaction as `GuardAdmitted`, and only a `WORKING` commitment can be
+admitted. Heartbeats advance persisted monotonic time only forwards. Expiry
+moves claimed work to `RECOVERY_PENDING` and invalidates issued reservations.
+Held locks are not released by worker lease expiry. Safe outcomes release held
+locks atomically; `UNCERTAIN` deliberately retains the action and locks.
 
 ## Read projections and restoration boundary
 
-Read methods return immutable store-side records. They are projections, not
-rehydrated mutable `GoalSpec`, `Commitment`, or `ClaimLease` values. In
-particular, persisted claim epochs and monotonic heartbeat ticks are exposed
-as validated raw numeric projection values. Those monotonic ticks are not
-valid lease time after process restart; S4 owns restart invalidation and
-recovery semantics.
+Read methods return immutable store-side records. `load_commitment` is the
+narrow validated restoration boundary for domain operations; it does not expose
+unchecked or mutable persisted fields. Persisted claim epochs and monotonic
+heartbeat ticks remain validated projection values, and old monotonic ticks are
+never treated as a live lease after restart. File-backed `open` performs schema
+migration and startup recovery before returning a usable store. The in-memory
+test constructor intentionally does not auto-recover.
 
 No unchecked constructors, generic setters, or unsafe reconstruction were
 added to the core domain for S2 convenience.

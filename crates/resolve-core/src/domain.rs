@@ -342,6 +342,85 @@ impl Commitment {
         })
     }
 
+    /// Rehydrate a commitment only after validating its persisted invariants.
+    #[allow(clippy::too_many_arguments)]
+    pub fn restore(
+        commitment_id: CommitmentId,
+        goal_id: GoalId,
+        parent_id: Option<CommitmentId>,
+        description: impl Into<String>,
+        state: CommitmentState,
+        prerequisites: Vec<Prerequisite>,
+        acceptance_refs: Vec<AcceptanceRef>,
+        claim: Option<(WorkerId, ClaimEpoch, MonotonicInstant)>,
+        outstanding_action: Option<TethersActionRef>,
+        last_claim_epoch: Option<ClaimEpoch>,
+    ) -> Result<Self, DomainError> {
+        let description = nonempty_description(description)?;
+        let claim = claim.map(|(worker_id, epoch, last_heartbeat)| ClaimLease {
+            worker_id,
+            epoch,
+            last_heartbeat,
+        });
+        if let (Some(high_water), Some(claim)) = (last_claim_epoch, claim.as_ref())
+            && claim.epoch() > high_water
+        {
+            return Err(DomainError::InvalidRestoredState {
+                reason: "active claim epoch exceeds the durable high-water mark",
+            });
+        }
+        let claim_required = matches!(
+            state,
+            CommitmentState::Claimed
+                | CommitmentState::Working
+                | CommitmentState::CompletionProposed
+        ) || matches!(
+            state,
+            CommitmentState::Waiting(ref reason) if !reason.is_uncertain_action()
+        );
+        if claim_required != claim.is_some() {
+            return Err(DomainError::InvalidRestoredState {
+                reason: "commitment state and active claim disagree",
+            });
+        }
+        if let Some(action_ref) = outstanding_action.as_ref() {
+            let action_state_is_valid = match &state {
+                CommitmentState::Working | CommitmentState::RecoveryPending => true,
+                CommitmentState::Waiting(WaitingReason::UncertainAction(waiting_action)) => {
+                    waiting_action == action_ref
+                }
+                _ => false,
+            };
+            if !action_state_is_valid {
+                return Err(DomainError::InvalidRestoredState {
+                    reason: "outstanding action disagrees with commitment state",
+                });
+            }
+        }
+        if matches!(
+            state,
+            CommitmentState::Waiting(WaitingReason::UncertainAction(_))
+        ) && claim.is_some()
+        {
+            return Err(DomainError::InvalidRestoredState {
+                reason: "uncertain waiting must not retain an active claim",
+            });
+        }
+
+        Ok(Self {
+            commitment_id,
+            goal_id,
+            parent_id,
+            description,
+            state,
+            prerequisites,
+            acceptance_refs,
+            claim,
+            outstanding_action,
+            last_claim_epoch,
+        })
+    }
+
     pub fn commitment_id(&self) -> &CommitmentId {
         &self.commitment_id
     }
@@ -376,6 +455,10 @@ impl Commitment {
 
     pub fn outstanding_action(&self) -> Option<&TethersActionRef> {
         self.outstanding_action.as_ref()
+    }
+
+    pub fn last_claim_epoch(&self) -> Option<ClaimEpoch> {
+        self.last_claim_epoch
     }
 
     pub fn activate(&mut self) -> Result<(), DomainError> {
@@ -431,6 +514,11 @@ impl Commitment {
         epoch: ClaimEpoch,
         target: ResumeTarget,
     ) -> Result<(), DomainError> {
+        if let CommitmentState::Waiting(WaitingReason::UncertainAction(action_ref)) = &self.state {
+            return Err(DomainError::RecoveryRequired {
+                action_ref: action_ref.clone(),
+            });
+        }
         self.require_current_claim(worker_id, epoch)?;
         let next_state = match target {
             ResumeTarget::Ready => CommitmentState::Ready,
@@ -643,6 +731,9 @@ pub enum WorkEvent {
         commitment_id: CommitmentId,
         action_ref: TethersActionRef,
     },
+    RecoveryReleased {
+        commitment_id: CommitmentId,
+    },
     StructuralProposalApplied {
         target: CommitmentId,
     },
@@ -792,6 +883,37 @@ mod tests {
         };
         assert!(outcome.is_uncertain());
         assert!(!matches!(outcome, TethersOutcome::Failed { .. }));
+    }
+
+    #[test]
+    fn uncertain_waiting_requires_explicit_recovery() {
+        let mut commitment = commitment();
+        commitment.activate().expect("commitment activates");
+        let claim = commitment
+            .claim_for(worker("worker-1"), MonotonicInstant::from_ticks(1))
+            .expect("claim succeeds");
+        commitment
+            .start(claim.worker_id(), claim.epoch())
+            .expect("claim starts work");
+        commitment
+            .wait(
+                claim.worker_id(),
+                claim.epoch(),
+                WaitingReason::UncertainAction(
+                    TethersActionRef::try_new("action-1").expect("action is valid"),
+                ),
+            )
+            .expect("uncertain waiting is representable");
+
+        let error = commitment
+            .resume(claim.worker_id(), claim.epoch(), ResumeTarget::Working)
+            .expect_err("uncertain work cannot use normal resume");
+        assert_eq!(
+            error,
+            DomainError::RecoveryRequired {
+                action_ref: TethersActionRef::try_new("action-1").expect("action is valid"),
+            }
+        );
     }
 
     #[test]
