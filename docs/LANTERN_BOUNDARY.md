@@ -9,5 +9,5 @@ Resolve owns only live operational coordination: goals, commitments, worker
 claims and leases, guards, scope locks, waiting/recovery state, and its own
 immutable work-event log.
 
-S0 establishes and documents this ownership boundary. No Lantern dependency,
+The repository documents and enforces this ownership boundary. No Lantern dependency,
 database table, or integration is added to Resolve01.

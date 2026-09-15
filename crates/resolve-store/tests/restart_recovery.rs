@@ -813,7 +813,7 @@ fn generic_persistence_cannot_clear_an_outstanding_action() {
     let error = store
         .persist_commitment_change(
             &stale,
-            4,
+            5,
             &WorkEvent::CommitmentCompletionProposed {
                 commitment_id: stale.commitment_id().clone(),
             },

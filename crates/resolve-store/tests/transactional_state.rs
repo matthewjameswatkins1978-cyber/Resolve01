@@ -152,7 +152,7 @@ fn failure_after_snapshot_update_before_commit_rolls_back_both() {
     let error = store
         .persist_commitment_change(&changed, 1, &activated_event(changed.commitment_id()), 3)
         .expect_err("foreign-key failure rolls back transaction");
-    assert!(matches!(error, StoreError::Sqlite(_)));
+    assert!(matches!(error, StoreError::InvalidMutation(_)));
     assert_eq!(store.list_events().expect("events load").len(), 2);
     let record = store
         .load_commitment_record(original.commitment_id())
@@ -276,13 +276,21 @@ fn normalized_references_claim_projection_and_attention_round_trip() {
         .insert_commitment(&commitment, &created_event(commitment.commitment_id()), 2)
         .expect("commitment persists");
     commitment.activate().expect("commitment activates");
+    store
+        .persist_commitment_change(
+            &commitment,
+            1,
+            &activated_event(commitment.commitment_id()),
+            3,
+        )
+        .expect("activation persists");
     let claim = commitment
         .claim_for(worker_id("worker-1"), MonotonicInstant::from_ticks(44))
         .expect("claim succeeds");
     store
         .persist_commitment_change(
             &commitment,
-            1,
+            2,
             &WorkEvent::CommitmentClaimed {
                 commitment_id: commitment.commitment_id().clone(),
                 worker_id: claim.worker_id().clone(),

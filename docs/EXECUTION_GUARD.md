@@ -16,7 +16,7 @@ Issuance reserves exact scope keys. Admission promotes those reservations to
 held locks atomically with the outstanding action reference. Held locks are
 not released by worker lease expiry or guard-token expiry.
 
-S3 and S4 implement the guard boundary in `resolve-core` and the synchronous SQLite
+R0 implements the guard boundary in `resolve-core` and the synchronous SQLite
 operations in `resolve-store`. A guard's validated `ScopeSet` must contain at
 least one `ScopeKey`; an empty scope set cannot reach guard issuance. Tethers
 must therefore provide at least one real opaque authoritative `ScopeKey` for
@@ -51,7 +51,7 @@ reservations are invalidated reactively during relevant scope operations and
 append `GuardReservationExpired`; no background sweeper exists.
 
 `GuardState::Resolved` and `GuardState::Uncertain` are typed domain states.
-S4 records Tethers outcomes transactionally: safe outcomes resolve the guard,
+The store records Tethers outcomes transactionally: safe outcomes resolve the guard,
 clear the outstanding action, and release its held locks; `UNCERTAIN` retains
 the action and held locks and moves the commitment to
 `WAITING(UncertainAction(action_ref))`. A normal resume cannot bypass that

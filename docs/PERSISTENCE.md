@@ -1,6 +1,6 @@
 # Persistence
 
-S2 and S3 implement the synchronous SQLite persistence boundary in
+R0 implements the synchronous SQLite persistence boundary in
 `crates/resolve-store`. Resolve owns the operational snapshot and event
 records; this crate does not own Lantern history or Tethers execution state.
 
@@ -26,8 +26,8 @@ file-backed databases for WAL tests.
 
 ## Schema ownership
 
-Schema version `4` is recorded in `metadata`. S4 migrates schema version 2 to
-3, and S5 migrates schema version 3 to 4, transactionally without recreating
+Schema version `4` is recorded in `metadata`. R0 migrates schema version 2 to
+3 and schema version 3 to 4, transactionally without recreating
 or discarding earlier data. The store owns
 these tables:
 
@@ -145,4 +145,4 @@ migration and startup recovery before returning a usable store. The in-memory
 test constructor intentionally does not auto-recover.
 
 No unchecked constructors, generic setters, or unsafe reconstruction were
-added to the core domain for S2 convenience.
+added to the core domain as a persistence convenience.
