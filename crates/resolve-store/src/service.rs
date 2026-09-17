@@ -7,10 +7,10 @@ use resolve_core::{
     StructuralProposal, TethersActionRef, TethersOutcome, WorkEvent, WorkerId,
 };
 
-/// Typed service boundary wrapping store operations.
+/// In-process typed service seam for Resolve store operations.
 ///
-/// This layer provides a clean API for external processes to interact with
-/// Resolve's operational state. It reuses existing store authority without
+/// This layer provides a narrow, typed API over the existing store authority.
+/// It is intended to support future external transport (HTTP, IPC) without
 /// adding new semantic capabilities.
 ///
 /// # Ownership
@@ -31,58 +31,10 @@ pub struct ResolveService {
     store: SqliteStore,
 }
 
-/// Typed response for guard admission operations.
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub enum GuardAdmissionResponse {
-    Admitted,
-    AlreadyAdmitted,
-    Rejected { reason: GuardRejectionReason },
-}
-
-/// Closed vocabulary for guard admission rejections.
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub enum GuardRejectionReason {
-    GuardNotFound,
-    GuardRevoked,
-    GuardAlreadyBound,
-    GuardExpired,
-    TaskNotActive,
-    OwnershipChanged,
-    FenceChanged,
-    ActionMismatch,
-    PreparationMismatch,
-    ScopeKeysMismatch,
-    StateUnavailable,
-    InternalIntegrity,
-}
-
-/// Typed response for outcome delivery operations.
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub enum OutcomeDeliveryResponse {
-    Recorded,
-    AlreadyRecorded,
-    Conflict,
-}
-
 impl ResolveService {
     /// Create a new service wrapping the provided store.
     pub fn new(store: SqliteStore) -> Self {
         Self { store }
-    }
-
-    /// Consume the service and return the inner store.
-    pub fn into_store(self) -> SqliteStore {
-        self.store
-    }
-
-    /// Borrow the inner store immutably.
-    pub fn store(&self) -> &SqliteStore {
-        &self.store
-    }
-
-    /// Borrow the inner store mutably.
-    pub fn store_mut(&mut self) -> &mut SqliteStore {
-        &mut self.store
     }
 
     // --- Goal operations ---

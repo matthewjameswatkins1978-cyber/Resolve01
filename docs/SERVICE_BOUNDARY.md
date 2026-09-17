@@ -1,14 +1,15 @@
 # Local Service Boundary
 
-R1-A1 introduces a typed service layer in `crates/resolve-store/src/service.rs`
-that wraps store operations into a clean API boundary.
+R1-A1 introduces a typed in-process service seam in
+`crates/resolve-store/src/service.rs` that wraps store operations into a
+narrow API boundary.
 
 ## Purpose
 
-The service layer creates a natural seam for external processes to interact with
-Resolve's operational state without adding new semantic authority. It reuses
-existing store authority and provides typed, testable access to all store
-operations.
+This is an in-process typed service seam intended to support future external
+transport. It is not an external-process boundary today. It reuses existing
+store authority and provides typed, testable access to a selected operational
+surface.
 
 ## Ownership
 
@@ -25,9 +26,9 @@ operations.
 - Historical memory (Lantern authority)
 - Transport (future concern)
 
-## Operations
+## Selected operational surface
 
-The service exposes all store operations through typed methods:
+The service exposes the following store operations through typed methods:
 
 ### Goal operations
 - `create_goal` - Create a new goal with initial revision
@@ -75,6 +76,10 @@ The service exposes all store operations through typed methods:
 
 ## Future use
 
-This service layer is designed to be wrapped by transport layers (HTTP, IPC,
-etc.) in future R1 packets. The Tethers Guard Protocol endpoints can be
-implemented by translating HTTP requests into service method calls.
+This service seam is designed to be wrapped by transport layers (HTTP, IPC)
+in future R1 packets. The Tethers Guard Protocol endpoints can be implemented
+by translating wire requests into service method calls.
+
+The canonical Tethers wire vocabulary (`resolve.tethers-guard/1`) is not
+duplicated here. It will be mapped explicitly when the actual transport slice
+is implemented.
