@@ -375,7 +375,9 @@ fn canonical_split_brain_survives_restart_and_duplicate_delivery() {
             "other-action",
             12
         ),
-        Err(StoreError::GuardInvalid { .. })
+        Err(StoreError::GuardAdmissionRejected(
+            resolve_store::GuardAdmissionRejection::GuardAlreadyBound
+        ))
     ));
 
     let mut clock = ManualClock::new(11);
@@ -761,7 +763,9 @@ fn claim_epoch_and_lease_boundaries_have_no_refresh_first_side_door() {
             "A-boundary",
             11
         ),
-        Err(StoreError::LeaseExpired { .. })
+        Err(StoreError::GuardAdmissionRejected(
+            resolve_store::GuardAdmissionRejection::GuardExpired
+        ))
     ));
     assert_eq!(
         store
@@ -1633,6 +1637,11 @@ fn sqlite_integrity_and_event_encoding_remain_explicit() {
 }
 
 fn create_legacy_fixture(path: &Path, version: i64) {
+    let commitment_v4_extra = if version >= 4 {
+        ", replacement_terminal_id TEXT"
+    } else {
+        ""
+    };
     let commitment_extra = if version >= 3 {
         ", last_claim_epoch INTEGER"
     } else {
@@ -1677,7 +1686,7 @@ fn create_legacy_fixture(path: &Path, version: i64) {
          CREATE TABLE commitments (
              commitment_id TEXT PRIMARY KEY NOT NULL, goal_id TEXT NOT NULL,
              parent_id TEXT, description TEXT NOT NULL, state_json TEXT NOT NULL,
-             outstanding_action TEXT, state_version INTEGER NOT NULL{commitment_extra}
+             outstanding_action TEXT, state_version INTEGER NOT NULL{commitment_extra}{commitment_v4_extra}
          );
          CREATE TABLE commitment_prerequisites (
              commitment_id TEXT NOT NULL, ordinal INTEGER NOT NULL,
@@ -1721,7 +1730,10 @@ fn create_legacy_fixture(path: &Path, version: i64) {
         )
         .expect("legacy revision persists");
     let state = "{\"state\":\"Proposed\"}";
-    if version >= 3 {
+    if version >= 4 {
+        connection.execute("INSERT INTO commitments VALUES ('commitment-legacy', 'goal-legacy', NULL, 'legacy commitment', ?1, NULL, 1, NULL, NULL)", [state])
+            .expect("legacy commitment persists");
+    } else if version >= 3 {
         connection.execute("INSERT INTO commitments VALUES ('commitment-legacy', 'goal-legacy', NULL, 'legacy commitment', ?1, NULL, 1, NULL)", [state])
             .expect("legacy commitment persists");
     } else {
@@ -1737,13 +1749,13 @@ fn create_legacy_fixture(path: &Path, version: i64) {
 }
 
 #[test]
-fn supported_schema_versions_migrate_to_v4_without_losing_data() {
-    for version in [1_i64, 2, 3] {
+fn supported_schema_versions_migrate_to_v5_without_losing_data() {
+    for version in [1_i64, 2, 3, 4] {
         let directory = tempdir().expect("temporary directory creates");
         let path = directory.path().join(format!("legacy-v{version}.sqlite"));
         create_legacy_fixture(&path, version);
         let store = SqliteStore::open(&path).expect("legacy fixture migrates");
-        assert_eq!(store.schema_version().expect("schema version reads"), 4);
+        assert_eq!(store.schema_version().expect("schema version reads"), 5);
         assert_eq!(store.journal_mode().expect("journal mode reads"), "wal");
         assert!(store.foreign_keys_enabled().expect("foreign keys read"));
         assert_eq!(
@@ -1761,8 +1773,8 @@ fn supported_schema_versions_migrate_to_v4_without_losing_data() {
             "legacy commitment"
         );
         drop(store);
-        let reopened = SqliteStore::open(&path).expect("v4 reopen succeeds");
-        assert_eq!(reopened.schema_version().expect("schema version reads"), 4);
+        let reopened = SqliteStore::open(&path).expect("v5 reopen succeeds");
+        assert_eq!(reopened.schema_version().expect("schema version reads"), 5);
     }
 }
 

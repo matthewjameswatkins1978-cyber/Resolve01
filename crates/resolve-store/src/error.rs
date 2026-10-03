@@ -1,5 +1,19 @@
 use resolve_core::DomainError;
 use std::fmt;
+/// Closed guard-admission reasons exposed by the canonical Tethers bridge.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GuardAdmissionRejection {
+    GuardRevoked,
+    GuardAlreadyBound,
+    GuardExpired,
+    TaskNotActive,
+    OwnershipChanged,
+    FenceChanged,
+    ActionMismatch,
+    PreparationMismatch,
+    ScopeKeysMismatch,
+    InternalIntegrity,
+}
 
 /// Errors returned by the synchronous SQLite persistence boundary.
 #[derive(Debug)]
@@ -45,6 +59,16 @@ pub enum StoreError {
     OutcomeConflict {
         action_ref: String,
     },
+    OutcomePreparationMismatch {
+        action_ref: String,
+    },
+    OutcomePreparationBindingMissing {
+        action_ref: String,
+    },
+    OutcomeCorrelationMismatch {
+        action_ref: String,
+    },
+    GuardAdmissionRejected(GuardAdmissionRejection),
     RecoveryBlocked {
         commitment_id: String,
         reason: String,
@@ -108,6 +132,21 @@ impl fmt::Display for StoreError {
                 formatter,
                 "commitment {commitment_id} has unresolved Tethers action {action_ref}"
             ),
+            Self::OutcomePreparationMismatch { action_ref } => write!(
+                formatter,
+                "preparation digest does not match Tethers action {action_ref}"
+            ),
+            Self::OutcomePreparationBindingMissing { action_ref } => write!(
+                formatter,
+                "Tethers action {action_ref} has no persisted preparation binding"
+            ),
+            Self::OutcomeCorrelationMismatch { action_ref } => write!(
+                formatter,
+                "Tethers action {action_ref} no longer matches its Resolve commitment"
+            ),
+            Self::GuardAdmissionRejected(reason) => {
+                write!(formatter, "guard admission rejected: {reason:?}")
+            }
             Self::OutcomeConflict { action_ref } => write!(
                 formatter,
                 "conflicting outcome received for Tethers action {action_ref}"

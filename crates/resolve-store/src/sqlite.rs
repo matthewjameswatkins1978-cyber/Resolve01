@@ -6,8 +6,8 @@ use resolve_core::{
     ClaimLease, Commitment, CommitmentId, CommitmentState, DomainError, ExecutionGuard, GoalId,
     GoalSpec, GoalState, GuardId, GuardState, HumanDecisionRef, MonotonicDuration,
     MonotonicInstant, NewCommitment, Prerequisite, ScopeKey, ScopeSet, StructuralChange,
-    StructuralProposal, TethersActionRef, TethersContractRef, TethersOutcome, WaitingReason,
-    WorkEvent, WorkerId,
+    StructuralProposal, TethersActionRef, TethersContractRef, TethersOutcome,
+    TethersPreparationDigest, WaitingReason, WorkEvent, WorkerId,
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
@@ -192,6 +192,7 @@ struct GuardRow {
     state: GuardState,
     reservation_expires_at: Option<MonotonicInstant>,
     state_version: i64,
+    preparation_digest: Option<TethersPreparationDigest>,
 }
 
 struct CommitmentContext {
@@ -215,6 +216,7 @@ struct RawGuardColumns {
     outcome_json: Option<String>,
     reservation_expires_at: Option<i64>,
     state_version: i64,
+    preparation_digest: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -226,6 +228,7 @@ pub struct GuardRecord {
     boot_generation: BootGeneration,
     state: GuardState,
     reservation_expires_at: Option<MonotonicInstant>,
+    preparation_digest: Option<TethersPreparationDigest>,
 }
 
 impl GuardRecord {
@@ -247,6 +250,10 @@ impl GuardRecord {
 
     pub fn boot_generation(&self) -> BootGeneration {
         self.boot_generation
+    }
+
+    pub fn preparation_digest(&self) -> Option<&TethersPreparationDigest> {
+        self.preparation_digest.as_ref()
     }
 
     pub fn state(&self) -> &GuardState {
@@ -1056,6 +1063,34 @@ impl SqliteStore {
         action_ref: TethersActionRef,
         now: MonotonicInstant,
     ) -> Result<GuardAdmission, StoreError> {
+        self.admit_guard_internal(guard_id, scope_keys, action_ref, None, now)
+    }
+
+    pub fn admit_guard_with_preparation(
+        &mut self,
+        guard_id: &GuardId,
+        scope_keys: ScopeSet,
+        action_ref: TethersActionRef,
+        preparation_digest: TethersPreparationDigest,
+        now: MonotonicInstant,
+    ) -> Result<GuardAdmission, StoreError> {
+        self.admit_guard_internal(
+            guard_id,
+            scope_keys,
+            action_ref,
+            Some(preparation_digest),
+            now,
+        )
+    }
+
+    fn admit_guard_internal(
+        &mut self,
+        guard_id: &GuardId,
+        scope_keys: ScopeSet,
+        action_ref: TethersActionRef,
+        preparation_digest: Option<TethersPreparationDigest>,
+        now: MonotonicInstant,
+    ) -> Result<GuardAdmission, StoreError> {
         let now_ticks = checked_i64(now.ticks(), "current monotonic instant")?;
         let transaction = self
             .connection
@@ -1066,41 +1101,42 @@ impl SqliteStore {
             GuardState::Admitted {
                 action_ref: existing,
             } if existing == &action_ref => {
+                if guard.preparation_digest != preparation_digest {
+                    return Err(StoreError::GuardAdmissionRejected(
+                        crate::GuardAdmissionRejection::PreparationMismatch,
+                    ));
+                }
                 if stored_scope_keys == scope_keys {
                     return Ok(GuardAdmission::AlreadyAdmitted);
                 }
-                return Err(StoreError::GuardInvalid {
-                    guard_id: guard_id.to_string(),
-                    reason: "admitted guard scope set cannot be changed".to_owned(),
-                });
+                return Err(StoreError::GuardAdmissionRejected(
+                    crate::GuardAdmissionRejection::ScopeKeysMismatch,
+                ));
             }
             GuardState::Admitted { .. } => {
-                return Err(StoreError::GuardInvalid {
-                    guard_id: guard_id.to_string(),
-                    reason: "guard is already admitted for another action".to_owned(),
-                });
+                return Err(StoreError::GuardAdmissionRejected(
+                    crate::GuardAdmissionRejection::GuardAlreadyBound,
+                ));
             }
             GuardState::Issued => {}
             _ => {
-                return Err(StoreError::GuardInvalid {
-                    guard_id: guard_id.to_string(),
-                    reason: format!("guard is in terminal state {:?}", guard.state),
-                });
+                return Err(StoreError::GuardAdmissionRejected(
+                    crate::GuardAdmissionRejection::GuardRevoked,
+                ));
             }
         }
 
         expire_relevant_reservations(&transaction, stored_scope_keys.as_slice(), now_ticks)?;
         guard = query_guard(&transaction, guard_id)?;
         if !matches!(guard.state, GuardState::Issued) {
-            return Err(StoreError::LeaseExpired {
-                commitment_id: guard.commitment_id.to_string(),
-            });
+            return Err(StoreError::GuardAdmissionRejected(
+                crate::GuardAdmissionRejection::GuardExpired,
+            ));
         }
         if stored_scope_keys != scope_keys {
-            return Err(StoreError::GuardInvalid {
-                guard_id: guard_id.to_string(),
-                reason: "admission scope set does not exactly match issuance".to_owned(),
-            });
+            return Err(StoreError::GuardAdmissionRejected(
+                crate::GuardAdmissionRejection::ScopeKeysMismatch,
+            ));
         }
         for scope_key in stored_scope_keys.as_slice() {
             let lock_matches: bool = transaction.query_row(
@@ -1112,19 +1148,18 @@ impl SqliteStore {
                 |row| row.get(0),
             )?;
             if !lock_matches {
-                return Err(StoreError::GuardInvalid {
-                    guard_id: guard_id.to_string(),
-                    reason: "reserved scope lock is missing or owned by another guard".to_owned(),
-                });
+                return Err(StoreError::GuardAdmissionRejected(
+                    crate::GuardAdmissionRejection::InternalIntegrity,
+                ));
             }
         }
         if guard
             .reservation_expires_at
             .is_none_or(|deadline| deadline.ticks() <= now.ticks())
         {
-            return Err(StoreError::LeaseExpired {
-                commitment_id: guard.commitment_id.to_string(),
-            });
+            return Err(StoreError::GuardAdmissionRejected(
+                crate::GuardAdmissionRejection::GuardExpired,
+            ));
         }
         let commitment = transaction
             .query_row(
@@ -1151,31 +1186,24 @@ impl SqliteStore {
             .ok_or_else(|| not_found("commitment", guard.commitment_id.to_string()))?;
         let state = decode_commitment_state(&commitment.state_json)?;
         if !matches!(state, CommitmentState::Working) {
-            return Err(StoreError::GuardInvalid {
-                guard_id: guard_id.to_string(),
-                reason: format!("commitment is in {state:?}, not WORKING"),
-            });
+            return Err(StoreError::GuardAdmissionRejected(
+                crate::GuardAdmissionRejection::TaskNotActive,
+            ));
         }
         if commitment.outstanding_action.is_some() {
-            return Err(StoreError::GuardInvalid {
-                guard_id: guard_id.to_string(),
-                reason: "commitment already has an outstanding action".to_owned(),
-            });
+            return Err(StoreError::GuardAdmissionRejected(
+                crate::GuardAdmissionRejection::ActionMismatch,
+            ));
         }
         let stored_epoch = commitment
             .claim_epoch
-            .ok_or_else(|| StoreError::ClaimMismatch {
-                commitment_id: guard.commitment_id.to_string(),
-                reason: "commitment has no current claim".to_owned(),
-            })?;
+            .ok_or(StoreError::GuardAdmissionRejected(
+                crate::GuardAdmissionRejection::OwnershipChanged,
+            ))?;
         if stored_epoch != checked_i64(guard.claim_epoch.value(), "claim epoch")? {
-            return Err(StoreError::ClaimMismatch {
-                commitment_id: guard.commitment_id.to_string(),
-                reason: format!(
-                    "claim epoch is {stored_epoch}, guard epoch is {}",
-                    guard.claim_epoch
-                ),
-            });
+            return Err(StoreError::GuardAdmissionRejected(
+                crate::GuardAdmissionRejection::FenceChanged,
+            ));
         }
         let last_claim_epoch = commitment
             .last_claim_epoch
@@ -1188,10 +1216,9 @@ impl SqliteStore {
         }
         let _worker = commitment
             .worker
-            .ok_or_else(|| StoreError::ClaimMismatch {
-                commitment_id: guard.commitment_id.to_string(),
-                reason: "commitment has no current claim".to_owned(),
-            })
+            .ok_or(StoreError::GuardAdmissionRejected(
+                crate::GuardAdmissionRejection::OwnershipChanged,
+            ))
             .and_then(|value| parse_id(value, "worker", WorkerId::try_new))?;
         let current_boot_generation = current_boot_generation(&transaction)?;
         if commitment.boot_generation
@@ -1201,10 +1228,9 @@ impl SqliteStore {
             )?)
             || guard.boot_generation != current_boot_generation
         {
-            return Err(StoreError::ClaimMismatch {
-                commitment_id: guard.commitment_id.to_string(),
-                reason: "claim and guard are not from the current boot generation".to_owned(),
-            });
+            return Err(StoreError::GuardAdmissionRejected(
+                crate::GuardAdmissionRejection::FenceChanged,
+            ));
         }
         let next_commitment_version = next_state_version(commitment.state_version)?;
         let next_guard_version = next_state_version(guard.state_version)?;
@@ -1226,11 +1252,12 @@ impl SqliteStore {
         }
         let changed = transaction.execute(
             "UPDATE execution_guards
-             SET state = 'admitted', action_ref = ?1, reservation_expires_at = NULL,
-                 state_version = ?2
-             WHERE guard_id = ?3 AND state = 'issued' AND state_version = ?4",
+             SET state = 'admitted', action_ref = ?1, preparation_digest = ?2,
+                 reservation_expires_at = NULL, state_version = ?3
+             WHERE guard_id = ?4 AND state = 'issued' AND state_version = ?5",
             params![
                 action_ref.as_ref(),
+                preparation_digest.as_ref().map(AsRef::as_ref),
                 next_guard_version,
                 guard_id.as_ref(),
                 guard.state_version
@@ -1259,6 +1286,7 @@ impl SqliteStore {
                 guard_id: guard_id.clone(),
                 commitment_id: guard.commitment_id.clone(),
                 action_ref,
+                preparation_digest,
             },
             now_ticks,
         )?;
@@ -1788,6 +1816,24 @@ impl SqliteStore {
         outcome: TethersOutcome,
         created_at: i64,
     ) -> Result<OutcomeRecording, StoreError> {
+        self.record_tethers_outcome_internal(outcome, None, created_at)
+    }
+
+    pub fn record_tethers_outcome_with_preparation(
+        &mut self,
+        outcome: TethersOutcome,
+        preparation_digest: TethersPreparationDigest,
+        created_at: i64,
+    ) -> Result<OutcomeRecording, StoreError> {
+        self.record_tethers_outcome_internal(outcome, Some(preparation_digest), created_at)
+    }
+
+    fn record_tethers_outcome_internal(
+        &mut self,
+        outcome: TethersOutcome,
+        preparation_digest: Option<TethersPreparationDigest>,
+        created_at: i64,
+    ) -> Result<OutcomeRecording, StoreError> {
         let action_ref = outcome.action_ref().clone();
         let transaction = self
             .connection
@@ -1802,6 +1848,21 @@ impl SqliteStore {
             .ok_or_else(|| not_found("Tethers action", action_ref.to_string()))?;
         let guard_id = parse_id(guard_id, "guard", GuardId::try_new)?;
         let guard = query_guard(&transaction, &guard_id)?;
+        match (&guard.preparation_digest, &preparation_digest) {
+            (None, Some(_)) => {
+                return Err(StoreError::OutcomePreparationBindingMissing {
+                    action_ref: action_ref.to_string(),
+                });
+            }
+            (Some(_), None) | (Some(_), Some(_))
+                if guard.preparation_digest != preparation_digest =>
+            {
+                return Err(StoreError::OutcomePreparationMismatch {
+                    action_ref: action_ref.to_string(),
+                });
+            }
+            _ => {}
+        }
         match &guard.state {
             GuardState::Resolved {
                 action_ref: existing_action,
@@ -1841,7 +1902,7 @@ impl SqliteStore {
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )?;
         if outstanding.as_deref() != Some(action_ref.as_ref()) {
-            return Err(StoreError::OutcomeConflict {
+            return Err(StoreError::OutcomeCorrelationMismatch {
                 action_ref: action_ref.to_string(),
             });
         }
@@ -1861,6 +1922,7 @@ impl SqliteStore {
             &goal_id,
             &WorkEvent::TethersOutcomeRecorded {
                 outcome: outcome.clone(),
+                preparation_digest,
             },
             created_at,
         )?;
@@ -2333,6 +2395,7 @@ impl SqliteStore {
             boot_generation: guard.boot_generation,
             state: guard.state,
             reservation_expires_at: guard.reservation_expires_at,
+            preparation_digest: guard.preparation_digest,
         })
     }
 
@@ -2971,7 +3034,8 @@ fn query_guard(transaction: &Transaction<'_>, guard_id: &GuardId) -> Result<Guar
     transaction
         .query_row(
             "SELECT guard_id, commitment_id, claim_epoch, boot_generation, state,
-                    action_ref, outcome_json, reservation_expires_at, state_version
+                    action_ref, outcome_json, reservation_expires_at, state_version,
+                    preparation_digest
              FROM execution_guards WHERE guard_id = ?1",
             params![guard_id.as_ref()],
             |row| {
@@ -2985,6 +3049,7 @@ fn query_guard(transaction: &Transaction<'_>, guard_id: &GuardId) -> Result<Guar
                     outcome_json: row.get(6)?,
                     reservation_expires_at: row.get(7)?,
                     state_version: row.get(8)?,
+                    preparation_digest: row.get(9)?,
                 })
             },
         )
@@ -3000,7 +3065,8 @@ fn query_guard_connection(
     connection
         .query_row(
             "SELECT guard_id, commitment_id, claim_epoch, boot_generation, state,
-                    action_ref, outcome_json, reservation_expires_at, state_version
+                    action_ref, outcome_json, reservation_expires_at, state_version,
+                    preparation_digest
              FROM execution_guards WHERE guard_id = ?1",
             params![guard_id.as_ref()],
             |row| {
@@ -3014,6 +3080,7 @@ fn query_guard_connection(
                     outcome_json: row.get(6)?,
                     reservation_expires_at: row.get(7)?,
                     state_version: row.get(8)?,
+                    preparation_digest: row.get(9)?,
                 })
             },
         )
@@ -3029,6 +3096,18 @@ fn decode_guard_row(columns: RawGuardColumns) -> Result<GuardRow, StoreError> {
         columns.outcome_json,
         columns.reservation_expires_at,
     )?;
+    let preparation_digest = columns
+        .preparation_digest
+        .map(TethersPreparationDigest::try_new)
+        .transpose()
+        .map_err(|error| StoreError::InvalidPersistedData(error.to_string()))?;
+    if preparation_digest.is_some()
+        && matches!(&state, GuardState::Issued | GuardState::Invalidated)
+    {
+        return Err(StoreError::InvalidPersistedData(
+            "unadmitted guard has a Tethers preparation binding".to_owned(),
+        ));
+    }
     Ok(GuardRow {
         guard_id: parse_id(columns.guard_id, "guard", GuardId::try_new)?,
         commitment_id: parse_id(columns.commitment_id, "commitment", CommitmentId::try_new)?,
@@ -3040,6 +3119,7 @@ fn decode_guard_row(columns: RawGuardColumns) -> Result<GuardRow, StoreError> {
             .map(MonotonicInstant::try_from_raw)
             .transpose()?,
         state_version: columns.state_version,
+        preparation_digest,
     })
 }
 
@@ -4336,6 +4416,7 @@ enum StoredEventPayload {
         guard_id: String,
         commitment_id: String,
         action_ref: String,
+        preparation_digest: Option<String>,
     },
     GuardInvalidated {
         guard_id: String,
@@ -4345,6 +4426,7 @@ enum StoredEventPayload {
     },
     TethersOutcomeRecorded {
         outcome: StoredTethersOutcome,
+        preparation_digest: Option<String>,
     },
     RecoveryCompleted {
         commitment_id: String,
@@ -4635,10 +4717,14 @@ fn encode_event_payload(event: &WorkEvent) -> StoredEventPayload {
             guard_id,
             commitment_id,
             action_ref,
+            preparation_digest,
         } => StoredEventPayload::GuardAdmitted {
             guard_id: guard_id.as_ref().to_owned(),
             commitment_id: commitment_id.as_ref().to_owned(),
             action_ref: action_ref.as_ref().to_owned(),
+            preparation_digest: preparation_digest
+                .as_ref()
+                .map(|digest| digest.as_ref().to_owned()),
         },
         WorkEvent::GuardInvalidated { guard_id } => StoredEventPayload::GuardInvalidated {
             guard_id: guard_id.as_ref().to_owned(),
@@ -4648,21 +4734,25 @@ fn encode_event_payload(event: &WorkEvent) -> StoredEventPayload {
                 guard_id: guard_id.as_ref().to_owned(),
             }
         }
-        WorkEvent::TethersOutcomeRecorded { outcome } => {
-            StoredEventPayload::TethersOutcomeRecorded {
-                outcome: match outcome {
-                    TethersOutcome::Succeeded { action_ref } => {
-                        StoredTethersOutcome::Succeeded(action_ref.as_ref().to_owned())
-                    }
-                    TethersOutcome::Failed { action_ref } => {
-                        StoredTethersOutcome::Failed(action_ref.as_ref().to_owned())
-                    }
-                    TethersOutcome::Uncertain { action_ref } => {
-                        StoredTethersOutcome::Uncertain(action_ref.as_ref().to_owned())
-                    }
-                },
-            }
-        }
+        WorkEvent::TethersOutcomeRecorded {
+            outcome,
+            preparation_digest,
+        } => StoredEventPayload::TethersOutcomeRecorded {
+            outcome: match outcome {
+                TethersOutcome::Succeeded { action_ref } => {
+                    StoredTethersOutcome::Succeeded(action_ref.as_ref().to_owned())
+                }
+                TethersOutcome::Failed { action_ref } => {
+                    StoredTethersOutcome::Failed(action_ref.as_ref().to_owned())
+                }
+                TethersOutcome::Uncertain { action_ref } => {
+                    StoredTethersOutcome::Uncertain(action_ref.as_ref().to_owned())
+                }
+            },
+            preparation_digest: preparation_digest
+                .as_ref()
+                .map(|digest| digest.as_ref().to_owned()),
+        },
         WorkEvent::RecoveryCompleted {
             commitment_id,
             action_ref,
