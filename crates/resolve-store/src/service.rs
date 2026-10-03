@@ -4,7 +4,8 @@ use crate::sqlite::SqliteStore;
 use resolve_core::{
     AttentionId, AttentionItem, BootGeneration, ClaimEpoch, Commitment, CommitmentId,
     ExecutionGuard, GoalId, GoalSpec, GuardId, MonotonicDuration, MonotonicInstant, ScopeSet,
-    StructuralProposal, TethersActionRef, TethersOutcome, WorkEvent, WorkerId,
+    StructuralProposal, TethersActionRef, TethersOutcome, TethersPreparationDigest, WorkEvent,
+    WorkerId,
 };
 
 /// In-process typed service seam for Resolve store operations.
@@ -119,6 +120,24 @@ impl ResolveService {
             .admit_guard(guard_id, scope_keys, action_ref, now)
     }
 
+    /// Admit a guard and durably pin the accepted Tethers preparation digest.
+    pub fn admit_guard_with_preparation(
+        &mut self,
+        guard_id: &GuardId,
+        scope_keys: ScopeSet,
+        action_ref: TethersActionRef,
+        preparation_digest: TethersPreparationDigest,
+        now: MonotonicInstant,
+    ) -> Result<GuardAdmission, StoreError> {
+        self.store.admit_guard_with_preparation(
+            guard_id,
+            scope_keys,
+            action_ref,
+            preparation_digest,
+            now,
+        )
+    }
+
     /// Explicitly invalidate an unadmitted guard.
     pub fn invalidate_guard(
         &mut self,
@@ -161,6 +180,17 @@ impl ResolveService {
         created_at: i64,
     ) -> Result<crate::OutcomeRecording, StoreError> {
         self.store.record_tethers_outcome(outcome, created_at)
+    }
+
+    /// Record an outcome only when it matches the preparation pinned at admission.
+    pub fn record_outcome_with_preparation(
+        &mut self,
+        outcome: TethersOutcome,
+        preparation_digest: TethersPreparationDigest,
+        created_at: i64,
+    ) -> Result<crate::OutcomeRecording, StoreError> {
+        self.store
+            .record_tethers_outcome_with_preparation(outcome, preparation_digest, created_at)
     }
 
     // --- Recovery operations ---
@@ -371,7 +401,7 @@ mod tests {
         let service = test_service();
 
         let schema_version = service.schema_version().expect("schema version loads");
-        assert_eq!(schema_version, 4);
+        assert_eq!(schema_version, 5);
 
         // In-memory stores don't auto-recover, so boot generation starts at 0
         let boot_gen = service.boot_generation().expect("boot generation loads");

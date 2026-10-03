@@ -1,15 +1,17 @@
-# Local Service Boundary
+# Resolve Service and Tethers Transport Boundaries
 
-R1-A1 introduces a typed in-process service seam in
-`crates/resolve-store/src/service.rs` that wraps store operations into a
-narrow API boundary.
+R1-A1 introduced the typed in-process service seam in
+`crates/resolve-store/src/service.rs`. R1-A2 adds a separate authenticated HTTPS
+adapter in `crates/resolve-transport` for the two operations in the canonical
+`docs/TETHERS_GUARD_PROTOCOL.md`.
 
 ## Purpose
 
-This is an in-process typed service seam intended to support future external
-transport. It is not an external-process boundary today. It reuses existing
-store authority and provides typed, testable access to a selected operational
-surface.
+The service remains in-process and reuses the existing store authority. The
+transport translates only protocol requests into typed service calls; it does
+not own policy, provider execution, retries, scheduling, or outcome
+reconciliation. The transport router exposes only guard admission and outcome
+delivery and is served through the explicit Rustls HTTPS entry point.
 
 ## Ownership
 
@@ -17,14 +19,14 @@ surface.
 - Inputs: Typed domain values
 - Outputs: Typed domain records
 - Authority: Reuses existing store authority
-- Failure semantics: All errors are typed and deterministic
+- Failure semantics: Service errors are typed; the transport maps closed guard
+  admission reasons into the canonical protocol vocabulary
 
 ## What this does NOT own
 
 - Policy decisions (Tethers authority)
 - Execution (Tethers authority)
 - Historical memory (Lantern authority)
-- Transport (future concern)
 
 ## Selected operational surface
 
@@ -44,6 +46,8 @@ The service exposes the following store operations through typed methods:
 ### Guard operations
 - `issue_guard` - Issue a guard and reserve scope keys atomically
 - `admit_guard` - Admit a guard using the exact scope set from the Tethers boundary
+- `admit_guard_with_preparation` - Atomically admit a guard and persist its typed
+  Tethers preparation digest for subsequent outcome correlation
 - `invalidate_guard` - Explicitly invalidate an unadmitted guard
 - `load_guard` - Load a guard record by identifier
 
@@ -52,6 +56,8 @@ The service exposes the following store operations through typed methods:
 
 ### Outcome operations
 - `record_outcome` - Record a Tethers outcome for the uniquely correlated action
+- `record_outcome_with_preparation` - Record an outcome only when its preparation
+  digest matches the value pinned at admission
 
 ### Recovery operations
 - `process_expired_claims` - Process expired claims and move them to recovery pending
@@ -74,12 +80,20 @@ The service exposes the following store operations through typed methods:
 - `journal_mode` - Check if WAL journal mode is enabled
 - `foreign_keys_enabled` - Check if foreign keys are enabled
 
-## Future use
+## HTTPS bridge
 
-This service seam is designed to be wrapped by transport layers (HTTP, IPC)
-in future R1 packets. The Tethers Guard Protocol endpoints can be implemented
-by translating wire requests into service method calls.
+The adapter accepts only `POST /internal/tethers/v1/guard/admit` and
+`POST /internal/tethers/v1/outcome`, with an explicit `X-Resolve-Tethers-Key`,
+`application/json`, strict duplicate-key rejection, closed object shapes, and a
+16 KiB request cap. It uses the existing canonical JSON/SHA-256 convention to
+bind responses to complete requests. A configured host supplies both Resolve
+clock readings and TLS certificate/key files. No plaintext production serve
+helper is provided.
 
-The canonical Tethers wire vocabulary (`resolve.tethers-guard/1`) is not
-duplicated here. It will be mapped explicitly when the actual transport slice
-is implemented.
+Schema v5 stores the preparation digest on each newly admitted guard. A v4 to
+v5 migration leaves existing rows unbound; outcome delivery through the new
+transport fails closed for those rows because no preparation identity can be
+reconstructed safely.
+
+The canonical Tethers wire vocabulary remains defined only in
+`docs/TETHERS_GUARD_PROTOCOL.md`.

@@ -2,5 +2,6 @@
 members = [
     "crates/resolve-core",
     "crates/resolve-store",
+    "crates/resolve-transport",
 ]
 resolver = "2"

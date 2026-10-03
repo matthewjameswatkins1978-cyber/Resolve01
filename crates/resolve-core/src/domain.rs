@@ -41,6 +41,39 @@ string_id!(AcceptanceRef, "acceptance");
 string_id!(AttentionId, "attention");
 string_id!(GuardId, "guard");
 
+/// Opaque digest identifying one accepted Tethers guard preparation.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct TethersPreparationDigest(String);
+
+impl TethersPreparationDigest {
+    pub fn try_new(value: impl Into<String>) -> Result<Self, DomainError> {
+        let value = value.into();
+        let is_digest = value.len() == 71
+            && value.starts_with("sha256:")
+            && value[7..]
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
+        if !is_digest {
+            return Err(DomainError::InvalidIdentifier {
+                kind: "Tethers preparation digest",
+            });
+        }
+        Ok(Self(value))
+    }
+}
+
+impl AsRef<str> for TethersPreparationDigest {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for TethersPreparationDigest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct GoalRevision(u64);
 
@@ -732,6 +765,7 @@ pub enum WorkEvent {
         guard_id: GuardId,
         commitment_id: CommitmentId,
         action_ref: TethersActionRef,
+        preparation_digest: Option<TethersPreparationDigest>,
     },
     GuardInvalidated {
         guard_id: GuardId,
@@ -741,6 +775,7 @@ pub enum WorkEvent {
     },
     TethersOutcomeRecorded {
         outcome: TethersOutcome,
+        preparation_digest: Option<TethersPreparationDigest>,
     },
     RecoveryCompleted {
         commitment_id: CommitmentId,

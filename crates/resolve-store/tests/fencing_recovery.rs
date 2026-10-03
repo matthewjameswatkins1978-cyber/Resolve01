@@ -1,7 +1,8 @@
 use resolve_core::{
     BootGeneration, ClaimEpoch, ClaimLease, Commitment, CommitmentId, ExecutionGuard, GoalId,
     GoalRevision, GoalSpec, GoalState, GuardId, GuardState, MonotonicDuration, MonotonicInstant,
-    ScopeKey, ScopeSet, TethersActionRef, Timestamp, WorkEvent, WorkerId,
+    ScopeKey, ScopeSet, TethersActionRef, TethersOutcome, TethersPreparationDigest, Timestamp,
+    WorkEvent, WorkerId,
 };
 use resolve_store::{GuardAdmission, GuardIssueRequest, SqliteStore, StoreError};
 use rusqlite::Connection;
@@ -261,7 +262,10 @@ fn claimed_commitment_must_start_before_admission() {
             MonotonicInstant::from_ticks(15),
         )
         .expect_err("claimed commitment cannot admit consequential work");
-    assert!(matches!(error, StoreError::GuardInvalid { .. }));
+    assert!(matches!(
+        error,
+        StoreError::GuardAdmissionRejected(resolve_store::GuardAdmissionRejection::TaskNotActive)
+    ));
     assert_eq!(store.list_events().expect("events load").len(), event_count);
     assert!(
         !store
@@ -551,7 +555,12 @@ fn admission_promotes_reservations_and_freezes_outstanding_action_atomically() {
             MonotonicInstant::from_ticks(15),
         )
         .expect_err("scope mismatch must be rejected");
-    assert!(matches!(error, StoreError::GuardInvalid { .. }));
+    assert!(matches!(
+        error,
+        StoreError::GuardAdmissionRejected(
+            resolve_store::GuardAdmissionRejection::ScopeKeysMismatch
+        )
+    ));
 
     assert_eq!(
         store
@@ -591,6 +600,122 @@ fn admission_promotes_reservations_and_freezes_outstanding_action_atomically() {
             .expect("same admission is idempotent"),
         GuardAdmission::AlreadyAdmitted
     );
+}
+
+#[test]
+fn preparation_digest_is_pinned_and_required_for_matching_outcome_delivery() {
+    let mut store = working_store();
+    let preparation = TethersPreparationDigest::try_new(format!("sha256:{}", "a".repeat(64)))
+        .expect("preparation digest is valid");
+    issue(
+        &mut store,
+        "guard-preparation",
+        "commitment-1",
+        ClaimEpoch::initial(),
+        "worker-1",
+        vec![scope("preparation")],
+        Timing {
+            now: 10,
+            ttl: 100,
+            claim_lease_duration: 99,
+        },
+    )
+    .expect("guard issues");
+    store
+        .admit_guard_with_preparation(
+            &guard_id("guard-preparation"),
+            scope_set(vec![scope("preparation")]),
+            action("action-preparation"),
+            preparation.clone(),
+            MonotonicInstant::from_ticks(10),
+        )
+        .expect("preparation is pinned on admission");
+    assert_eq!(
+        store
+            .load_guard_record(&guard_id("guard-preparation"))
+            .expect("guard loads")
+            .preparation_digest(),
+        Some(&preparation)
+    );
+
+    let wrong = TethersPreparationDigest::try_new(format!("sha256:{}", "b".repeat(64)))
+        .expect("second digest is valid");
+    assert!(matches!(
+        store.admit_guard_with_preparation(
+            &guard_id("guard-preparation"),
+            scope_set(vec![scope("preparation")]),
+            action("action-preparation"),
+            wrong.clone(),
+            MonotonicInstant::from_ticks(11),
+        ),
+        Err(StoreError::GuardAdmissionRejected(
+            resolve_store::GuardAdmissionRejection::PreparationMismatch
+        ))
+    ));
+    let outcome = TethersOutcome::Succeeded {
+        action_ref: action("action-preparation"),
+    };
+    assert!(matches!(
+        store.record_tethers_outcome_with_preparation(outcome.clone(), wrong, 11),
+        Err(StoreError::OutcomePreparationMismatch { .. })
+    ));
+    assert_eq!(
+        store
+            .record_tethers_outcome_with_preparation(outcome.clone(), preparation.clone(), 12)
+            .expect("matching outcome records"),
+        resolve_store::OutcomeRecording::Recorded
+    );
+    assert_eq!(
+        store
+            .record_tethers_outcome_with_preparation(outcome, preparation, 13)
+            .expect("exact delivery redelivers idempotently"),
+        resolve_store::OutcomeRecording::AlreadyRecorded
+    );
+}
+
+#[test]
+fn preparation_aware_outcome_fails_closed_for_legacy_unbound_guard() {
+    let mut store = working_store();
+    issue(
+        &mut store,
+        "guard-legacy-preparation",
+        "commitment-1",
+        ClaimEpoch::initial(),
+        "worker-1",
+        vec![scope("legacy-preparation")],
+        Timing {
+            now: 10,
+            ttl: 100,
+            claim_lease_duration: 99,
+        },
+    )
+    .expect("guard issues");
+    store
+        .admit_guard(
+            &guard_id("guard-legacy-preparation"),
+            scope_set(vec![scope("legacy-preparation")]),
+            action("action-legacy-preparation"),
+            MonotonicInstant::from_ticks(10),
+        )
+        .expect("legacy in-process admission succeeds");
+    assert!(
+        store
+            .load_guard_record(&guard_id("guard-legacy-preparation"))
+            .expect("legacy guard loads")
+            .preparation_digest()
+            .is_none()
+    );
+    assert!(matches!(
+        store.record_tethers_outcome_with_preparation(
+            TethersOutcome::Succeeded {
+                action_ref: action("action-legacy-preparation"),
+            },
+            TethersPreparationDigest::try_new(format!("sha256:{}", "c".repeat(64)))
+                .expect("preparation is valid"),
+            11,
+        ),
+        Err(StoreError::OutcomePreparationBindingMissing { .. })
+    ));
 }
 
 #[test]
@@ -878,7 +1003,7 @@ fn migration_preserves_v1_data_and_reopen_is_idempotent() {
     drop(connection);
 
     let store = SqliteStore::open(&path).expect("v1 migrates");
-    assert_eq!(store.schema_version().expect("version reads"), 4);
+    assert_eq!(store.schema_version().expect("version reads"), 5);
     assert_eq!(
         store
             .load_goal_record(&GoalId::try_new("goal-legacy").expect("id is valid"))
@@ -893,7 +1018,7 @@ fn migration_preserves_v1_data_and_reopen_is_idempotent() {
             .expect("reopen succeeds")
             .schema_version()
             .expect("version reads"),
-        4
+        5
     );
 }
 
